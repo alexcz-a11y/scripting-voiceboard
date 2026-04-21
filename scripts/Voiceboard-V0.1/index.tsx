@@ -49,6 +49,7 @@ import {
   readLog,
   readOpenAIKey,
   readPolishMs,
+  readPolishTimeoutSec,
   readRawText,
   readScribeKey,
   readSessionEndedAt,
@@ -67,6 +68,7 @@ import {
   writeHeartbeat,
   writeOpenAIKey,
   writePolishMs,
+  writePolishTimeoutSec,
   writeRawText,
   writeScribeKey,
   writeSessionEndedAt,
@@ -123,6 +125,12 @@ let cycleEndInFlight = false
 // coldStartArmed 未读到用户偏好时的默认时长。3 min 与主页 duration picker
 // 默认档位一致；用户第一次从键盘激活、还没在主 app 配置过时就是这个值。
 const DEFAULT_WARM_DURATION_MS = 3 * 60 * 1000
+
+// Stage 5a — 调试回放用的 AVPlayer 单例。MainView "录音文件" section 的
+// ▶/⏸ 按钮使用，让用户能听刚录的 m4a，排查"转录不对"到底是录音坏了还是
+// STT/polish 理解错。纯调试工具：不接 warm/armed session 的任何生命周期，
+// 不 dispose（Scripting 关 script 时会自动回收）。
+let debugPlayer: AVPlayer | null = null
 
 async function configureAudioSession(): Promise<void> {
   log("setCategory(playAndRecord, [defaultToSpeaker])")
@@ -802,6 +810,12 @@ async function polishWithOpenAI(
 ): Promise<string> {
   log("openai POST · raw len=", rawText.length)
   const t0 = Date.now()
+  // Stage 5b — 读用户配置的超时（默认 20s，预设 10/20/30/60，可配 5-120s）。
+  // 超时后 fetch Promise reject，调用者（stopAndTranscribe 的 catch）会写
+  // error + errorKind="polish"，**不清 rawText**，键盘 done-consume 的
+  // finalText > rawText > error 优先级自然降级到未润色原文。
+  const timeoutSec = readPolishTimeoutSec()
+  log("openai timeout=", timeoutSec, "s")
   // Responses API 的 input 接受 plain string（隐式 user role），是最简形式。
   // reasoning.effort 在测试期保持 "none" 关掉思考，加快响应、节省 token。
   // 文档支持的 effort 值：none | minimal | low | medium | high | xhigh
@@ -819,6 +833,8 @@ async function polishWithOpenAI(
       reasoning: { effort: "none" },
       max_output_tokens: 1024,
     }),
+    timeout: timeoutSec,
+    debugLabel: "openai.polish",
   })
   const elapsedMs = Date.now() - t0
   log("openai response", res.status, `${elapsedMs}ms`)
@@ -835,6 +851,34 @@ async function polishWithOpenAI(
   log("openai polished len=", text.length, "preview=", text.slice(0, 60))
   writePolishMs(elapsedMs)
   return text
+}
+
+// Stage 5a — 调试回放。点 ▶ 从头播放当前 filePath 指向的 m4a。
+//
+// 设计选择：每次点 ▶ 都调 `stop()` 重置到开头（而非从暂停处继续）。用户
+// 心智：▶ = 重新播一遍。这样在 ⏸ 之后再点 ▶ 行为稳定，不会出现"上次播
+// 到哪里了"的歧义。如果未来要"从暂停处继续"可以加独立 `▶▶ 继续` 按钮。
+//
+// Singleton：`debugPlayer` 在模块级 `let`。首次调用时 lazy 创建 + 绑 onError
+// / onEnded 两个 log 回调；之后的调用复用同一实例，只换 source。不 dispose。
+function debugPlayback(path: string): void {
+  if (debugPlayer === null) {
+    debugPlayer = new AVPlayer()
+    debugPlayer.onError = (m) => logErr("debug player:", m)
+    debugPlayer.onEnded = () => log("debug player ended")
+  }
+  debugPlayer.stop()
+  const ok = debugPlayer.setSource(path)
+  if (!ok) {
+    logErr("debug player setSource failed:", path)
+    return
+  }
+  const played = debugPlayer.play()
+  if (!played) logErr("debug player play() returned false")
+}
+
+function debugPlaybackPause(): void {
+  if (debugPlayer !== null) debugPlayer.pause()
 }
 
 async function transcribeWithScribe(
@@ -1039,6 +1083,9 @@ async function resetToIdle(): Promise<void> {
   clearSessionEndedAt()
   clearRawText()
   clearFinalText()
+  // Stage 5.1：err 和 errorKind 配对清掉。原代码只清了 errorKind 漏了 err，
+  // 依赖 MainView 按钮 action 里的 `clearError()` 补救；不健壮。
+  clearError()
   clearErrorKind()
   clearSttMs()
   clearPolishMs()
@@ -1526,6 +1573,11 @@ function MainView() {
     if (prev !== null && prev > 0) return Math.round(prev / 60000)
     return 3
   })
+  // Stage 5b — polish timeout picker 当前选择（秒）。readPolishTimeoutSec
+  // 对脏数据 / 未设置过自动 fallback 到默认 20s，拿回来就是合法值。
+  const [polishTimeoutPick, setPolishTimeoutPick] = useState<number>(() =>
+    readPolishTimeoutSec()
+  )
 
   useEffect(() => {
     const q = Script.queryParameters ?? {}
@@ -1748,6 +1800,34 @@ function MainView() {
             </Text>
           </VStack>
 
+          {/* Stage 5b — polish 超时预设选择。脚本默认 20s，用户可按网络
+               情况调大调小。点按钮即写 Storage + 刷新本地 state；下一次
+               polish fetch 会读到新值。 */}
+          <VStack spacing={4} alignment="leading">
+            <Text font="caption" foregroundStyle="secondaryLabel">
+              润色超时（polish timeout）· 当前 {polishTimeoutPick}s
+            </Text>
+            <HStack spacing={6}>
+              {[10, 20, 30, 60].map((sec) => (
+                <Button
+                  key={`polish-to-${sec}`}
+                  title={
+                    polishTimeoutPick === sec ? `✓ ${sec}s` : `${sec}s`
+                  }
+                  action={() => {
+                    writePolishTimeoutSec(sec)
+                    setPolishTimeoutPick(sec)
+                    setTick((t) => t + 1)
+                  }}
+                />
+              ))}
+              <Spacer />
+            </HStack>
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              网速慢 / 海外 / 蜂窝网络建议 30s+；超时后会降级插入未润色原文。
+            </Text>
+          </VStack>
+
           <VStack spacing={4} alignment="leading">
             <Text font="caption" foregroundStyle="secondaryLabel">
               状态
@@ -1857,6 +1937,18 @@ function MainView() {
                 录音文件
               </Text>
               <Text font="footnote">{filePath}</Text>
+              {/* Stage 5a — 调试回放。filePath.length===0 是 startWarmSession
+                   置空的情况（warm 还没录过），按钮隐藏避免空播。 */}
+              {filePath.length > 0 ? (
+                <HStack spacing={8}>
+                  <Button
+                    title="▶ 播放"
+                    action={() => debugPlayback(filePath)}
+                  />
+                  <Button title="⏸ 暂停" action={debugPlaybackPause} />
+                  <Spacer />
+                </HStack>
+              ) : null}
               {sessionStartedAt !== null ? (
                 <Text font="footnote" foregroundStyle="secondaryLabel">
                   started at {sessionStartedAt}
