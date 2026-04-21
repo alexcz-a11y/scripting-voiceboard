@@ -16,16 +16,29 @@ export const K_ACTIVE_TREE = "vb:activeTree"
 export const K_ERROR_KIND = "vb:errorKind"
 export const K_STT_MS = "vb:sttMs"
 export const K_POLISH_MS = "vb:polishMs"
+// Stage 4.5b — warm 保持态时长。warmUntil 是 ms timestamp，0 或过期（< Date.now()）
+// 代表非 warm。warmDurationMs 是用户上一次选的时长，用于激活面板回显。
+export const K_WARM_UNTIL = "vb:warmUntil"
+export const K_WARM_DURATION_MS = "vb:warmDurationMs"
 
 export const RECORDINGS_SUBDIR = "Voiceboard"
+// Stage 4.5b — 静音 keeper 录音文件名。warm 窗口内持续录到这里（覆盖写），
+// teardown 时 dispose 即可；暂不做分段轮转（A2/A3 实测 5 min 无挂起，
+// 单文件在 60 min 上限下 ~170MB 可接受；真需要轮转等 Stage 5+ 评估）。
+export const WARM_KEEPER_FILENAME = "warm_keeper.m4a"
 
 export type VBState =
   | "idle"
+  | "warm"
   | "armed"
   | "transcribing"
   | "polishing"
   | "done"
-export type VBAction = "stop"
+// Stage 4.5b — 键盘 → index 的动作信号集。
+//   stop  — 结束当前录音（现有，armed → transcribing 路径）
+//   arm   — 热启动：在 warm 态下建 fresh real recorder，让 warm → armed。
+//           走这条就说明有 warm session 活着，不要再 cold-start。
+export type VBAction = "stop" | "arm"
 // Error classification for unified abort() handling:
 //   setup  — pre-flight failure (missing key, missing file path, etc.)
 //   record — AudioRecorder create / start / mid-recording failure
@@ -152,6 +165,36 @@ export function clearPolishMs(): void {
   Storage.remove(K_POLISH_MS, opts)
 }
 
+// Stage 4.5b — warm 保持态时间戳。
+//   readWarmUntil() > Date.now()  → warm 还在窗口内
+//   readWarmUntil() === null or < Date.now() → 非 warm / 过期
+// 键盘 fast-path 判断用这个。index 的 worker tick 每帧也检查过期。
+export function readWarmUntil(): number | null {
+  return Storage.get<number>(K_WARM_UNTIL, opts) ?? null
+}
+
+export function writeWarmUntil(ts: number): void {
+  Storage.set(K_WARM_UNTIL, ts, opts)
+}
+
+export function clearWarmUntil(): void {
+  Storage.remove(K_WARM_UNTIL, opts)
+}
+
+// warmDurationMs 是用户上次选的时长（ms）。纯 UI 辅助，用于 MainView
+// 激活面板回显"上次选的是 3 min"之类；机制上不参与决策。
+export function readWarmDurationMs(): number | null {
+  return Storage.get<number>(K_WARM_DURATION_MS, opts) ?? null
+}
+
+export function writeWarmDurationMs(ms: number): void {
+  Storage.set(K_WARM_DURATION_MS, ms, opts)
+}
+
+export function clearWarmDurationMs(): void {
+  Storage.remove(K_WARM_DURATION_MS, opts)
+}
+
 export function readScribeKey(): string | null {
   return Storage.get<string>(K_SCRIBE_KEY, opts) ?? null
 }
@@ -232,6 +275,14 @@ export async function buildRecordingPath(): Promise<string> {
   const dir = await ensureRecordingsDir()
   const ts = Date.now()
   return Path.join(dir, `rec_${ts}.m4a`)
+}
+
+// Stage 4.5b — warm 窗口期间的静音 keeper 文件。单文件覆盖写，
+// stopWarmSession 时 dispose 即可；不做时间戳命名避免 warm 窗口
+// 结束后残留一堆历史文件。
+export async function buildWarmKeeperPath(): Promise<string> {
+  const dir = await ensureRecordingsDir()
+  return Path.join(dir, WARM_KEEPER_FILENAME)
 }
 
 export type LogEntry = { ts: number; src: string; msg: string }

@@ -25,13 +25,13 @@ import {
   readSessionEndedAt,
   readSessionStartedAt,
   readState,
+  readWarmUntil,
   VBErrorKind,
   VBState,
   vblog,
   vblogErr,
   writeAction,
   writeActiveTree,
-  writeState,
 } from "./shared"
 
 function log(...args: unknown[]): void {
@@ -54,14 +54,27 @@ const TREE_ID = `t${Date.now().toString(36)}-${Math.random()
   .toString(36)
   .slice(2, 6)}`
 
-type Mode = "idle" | "recording" | "processing" | "done" | "other"
+// Stage 4.5b — mode `"warm"` 独立一档：不折进 idle，因为两者用户心智完全不同：
+//   idle → 点 mic 会冷启动 Scripting（完整 URL scheme 流程）
+//   warm → 点 mic 会复用已激活的保持态，走 run （onResume）而非 run_single
+// 键盘 UI 也会给两种态不同的 mic 文案（"🎙 开始" vs "🎙 录音"）和状态栏
+// （idle 提示"未就绪"，warm 显示"保持中 剩余 MM:SS"）。
+type Mode = "idle" | "warm" | "recording" | "processing" | "done" | "other"
 
 function classify(state: VBState): Mode {
   if (state === "idle") return "idle"
+  if (state === "warm") return "warm"
   if (state === "done") return "done"
   if (state === "armed") return "recording"
   if (state === "transcribing" || state === "polishing") return "processing"
   return "other"
+}
+
+function fmtMMSS(sec: number): string {
+  const s = Math.max(0, Math.floor(sec))
+  const m = Math.floor(s / 60)
+  const pad = (n: number) => (n < 10 ? `0${n}` : String(n))
+  return `${pad(m)}:${pad(s % 60)}`
 }
 
 function isKeyboardAttachedToInput(): boolean {
@@ -122,6 +135,9 @@ function VoiceboardKeyboard() {
       setTick((v) => v + 1)
       const stateNow = readState()
       const activeTree = readActiveTree()
+      // Stage 4.5b — warm 窗口内也必须 fast poll，否则用户看到的倒计时
+      // 会 5s 跳一次。L3 的 "stateNow !== 'idle'" 分支本身就覆盖了 warm，
+      // 这里显式列出以示意图。
       const shouldFast =
         activeTree === null ||
         activeTree === TREE_ID ||
@@ -182,7 +198,12 @@ function VoiceboardKeyboard() {
   const heartbeat = readHeartbeat()
   const rawText = readRawText()
   const finalText = readFinalText()
+  // Stage 4.5b — warm 剩余秒数（给 statusLine 显示）。warmUntil 过期也当
+  // 非 warm 处理（cold path 会兜底）。
+  const warmUntil = readWarmUntil()
   const now = Date.now()
+  const warmRemainingSec =
+    warmUntil !== null ? Math.max(0, Math.floor((warmUntil - now) / 1000)) : 0
 
   const mode = classify(state)
 
@@ -289,8 +310,12 @@ function VoiceboardKeyboard() {
     clearSessionStartedAt()
     clearSessionEndedAt()
     // 注：err 不在这里清，留在主 app 错误区供用户查看；下次 startSession 会清
-    writeState("idle")
-    log("state=idle · session fully consumed")
+    //
+    // Stage 4.5b —— 不再在这里 writeState("idle")！
+    // 状态写入单一所有权：warm ↔ idle / warm ↔ armed 的转换由 index 的
+    // worker 基于"rawText/finalText 已清空"的信号 + warmUntil 判断。
+    // 键盘只负责把文本插到目标输入框，不动 state。
+    log("done consumed · text inserted, cleared · state 留给 index 推进")
   }, [
     mode,
     filePath,
@@ -316,6 +341,8 @@ function VoiceboardKeyboard() {
     switch (mode) {
       case "idle":
         return "未就绪 · 点麦克风开始录音"
+      case "warm":
+        return `保持中 · 剩余 ${fmtMMSS(warmRemainingSec)} · 点麦克风直接录音`
       case "recording": {
         const sec =
           sessionStartedAt !== null
@@ -336,6 +363,10 @@ function VoiceboardKeyboard() {
     switch (mode) {
       case "idle":
         return "🎙 开始"
+      case "warm":
+        // 区别于 idle 的"开始"：warm 下键盘是"热启动"，文案给用户"马上录"
+        // 的心智，和 Typeless 对齐。
+        return "🎙 录音"
       case "recording":
         return "■ 停止"
       case "processing":
@@ -371,11 +402,84 @@ function VoiceboardKeyboard() {
     // sees state transitions without a 5s lag.
     wakeRef.wake()
     CustomKeyboard.playInputClick()
+
     if (mode === "recording") {
       log("writeAction(stop)")
       writeAction("stop")
       return
     }
+
+    // ------------------------------------------------------------------
+    // Stage 4.5b v2 — warm fast-path（选项乙 + 过期回退）
+    //
+    // warm 态 + heartbeat 新鲜 = index worker 确定在后台转 → 纯 Storage 信号
+    // 触发，**不跳转 Scripting**。用户留在当前 app，录音直接开始（和 Typeless
+    // 完全一致，无切屏动画）。
+    //
+    // 4.5b v1 曾经在这里无条件 openURL("scripting://run/...") 触发 onResume
+    // 唤醒。真机实测日志（2026-04-21 01:26）证明 worker 在 onResume 触发前
+    // 就已经处理了 action —— 说明 worker 本来就在背景跑，openURL 的唯一效果
+    // 是把 Scripting 切到前台，用户体验成"每次录音都跳一下"。
+    //
+    // v2 策略（对应用户要求"跳转应该取决于状态和条件"）：
+    //   1. mode=warm + warmUntil 未过期 + heartbeat 新鲜 → 仅 writeAction("arm")
+    //      worker 在 ≤400ms 内读取到并 armFromWarm；完全无切屏。
+    //   2. mode=warm + warmUntil 未过期 + heartbeat 过期 (>2s) → 说明 worker
+    //      真的被挂起了 → 写 action + openURL 唤醒。这种情况在 v2 的"keeper
+    //      全程跑"架构下理论上不应该发生，但保留为安全网。
+    //   3. mode=warm + warmUntil 过期 → fall through idle 冷启动路径。
+    // ------------------------------------------------------------------
+    if (mode === "warm") {
+      const wu = readWarmUntil()
+      if (wu === null || wu <= Date.now()) {
+        log("onMicTap · warm but warmUntil expired → cold path")
+        // fall through to idle branch below
+      } else {
+        // 刷新读一次 heartbeat（render 时的闭包可能已经过时几十 ms）
+        const hb = readHeartbeat()
+        const hbAgeMs = hb !== null ? Date.now() - hb : Infinity
+        const workerAlive = hbAgeMs < 2000
+
+        writeAction("arm")
+
+        if (workerAlive) {
+          // 主路径：纯 Storage 信号，无切屏。worker 会在 ≤400ms 内处理。
+          log(
+            "warm fast-path · writeAction(arm) · NO openURL",
+            "(worker alive, heartbeat",
+            hbAgeMs,
+            "ms old)"
+          )
+          setOpenURLResult(
+            `warm action=arm 已写 · heartbeat ${hbAgeMs}ms · 不跳转`
+          )
+          return
+        }
+
+        // 兜底：heartbeat 过期 → worker 可能被 iOS 挂起 → openURL 唤醒
+        const url = Script.createRunURLScheme(Script.name, {
+          action: "arm",
+        })
+        logErr(
+          "warm fast-path · heartbeat stale (",
+          hbAgeMs,
+          "ms) · fallback openURL ->",
+          url
+        )
+        try {
+          const ok = await Safari.openURL(url)
+          log("Safari.openURL(run) fallback returned", ok)
+          setOpenURLResult(
+            `warm fallback openURL (heartbeat ${hbAgeMs}ms stale) returned ${String(ok)}`
+          )
+        } catch (e) {
+          logErr("Safari.openURL(run) threw:", String(e))
+          setOpenURLResult(`warm fallback openURL threw ${String(e)}`)
+        }
+        return
+      }
+    }
+
     if (mode === "idle") {
       const url = Script.createRunSingleURLScheme(Script.name, {
         action: "arm",

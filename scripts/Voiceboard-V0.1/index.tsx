@@ -22,6 +22,7 @@ import {
 
 import {
   buildRecordingPath,
+  buildWarmKeeperPath,
   clearAction,
   clearActiveTree,
   clearError,
@@ -35,6 +36,8 @@ import {
   clearSessionEndedAt,
   clearSessionStartedAt,
   clearSttMs,
+  clearWarmDurationMs,
+  clearWarmUntil,
   ensureRecordingsDir,
   formatLog,
   readAction,
@@ -52,6 +55,8 @@ import {
   readSessionStartedAt,
   readSttMs,
   readState,
+  readWarmDurationMs,
+  readWarmUntil,
   VBErrorKind,
   vblog,
   vblogErr,
@@ -68,6 +73,8 @@ import {
   writeSessionStartedAt,
   writeSttMs,
   writeState,
+  writeWarmDurationMs,
+  writeWarmUntil,
 } from "./shared"
 
 function log(...args: unknown[]): void {
@@ -81,6 +88,41 @@ let recorder: AudioRecorder | null = null
 let lastRecorderError: string | null = null
 let workerCancelled = false
 let sessionActive = false
+
+// ---------------------------------------------------------------------------
+// Stage 4.5b — warm 保持态模块级状态
+//
+// 和 4.5a 实验的 `silentKeeper` / `expActivity` 变量区分开：实验变量仅在
+// experiment 运行时用，生产 warm 路径用下面这组。两组互斥（experiment 启动
+// 前会检查 sessionActive；startWarmSession 会拒绝 expRunning 非空的情况）。
+// ---------------------------------------------------------------------------
+
+// warm 窗口内持续录到 warm_keeper.m4a 的静音 recorder。arm 时停掉并 dispose，
+// stop/cycle end 后 restart。生命周期严格挂在 warm 状态上。
+let warmSilentKeeper: AudioRecorder | null = null
+
+// warm/armed/processing 全程同一个 LiveActivity instance。startWarmSession
+// 创建，stopWarmSession end。中间只做 update，不换 instance。
+let warmActivity: LiveActivity<VBActivityState> | null = null
+
+// LA update 节流：全局 ≥1s/次。iOS 对 audio 模式 + 高频 LA update 有限流
+// （Apple dev forum 明确），超频会被 forbid；worker tick 400ms 自然会超
+// 限，必须自己在这里挡。
+let lastActivityUpdateAt = 0
+const ACTIVITY_UPDATE_MIN_GAP_MS = 1000
+
+// "state=done 之后过了多久" 记账。worker 用它来给 keyboard 一个消费窗口：
+// 至少等 1s（让键盘 400ms poll 至少跑 2 轮）+ 最多等 3s（keyboard 消费
+// 完会清 rawText/finalText，worker 检测到即调 handleCycleEnd；若 keyboard
+// 没消费到，3s 后也强制推进避免卡死）。
+let doneStateSetAt = 0
+
+// handleCycleEnd 已经排期了吗？防止 worker tick 重复触发。
+let cycleEndInFlight = false
+
+// coldStartArmed 未读到用户偏好时的默认时长。3 min 与主页 duration picker
+// 默认档位一致；用户第一次从键盘激活、还没在主 app 配置过时就是这个值。
+const DEFAULT_WARM_DURATION_MS = 3 * 60 * 1000
 
 async function configureAudioSession(): Promise<void> {
   log("setCategory(playAndRecord, [defaultToSpeaker])")
@@ -156,11 +198,20 @@ async function startRecorder(): Promise<boolean> {
   return true
 }
 
+// Legacy cold-start without warm 保持机制：仅用于 MainView 的"开启录音会话
+// （前台）" debug 按钮 + foregroundTestRecord。**用户走键盘 cold-start 的路径
+// 应改调 coldStartArmed（经 warm 全套 → armed），不走这条老路。**
 async function startSession(): Promise<void> {
   if (sessionActive) {
     log("startSession: already active")
     return
   }
+  // 归零 activeTree：新 session 起手，让所有键盘树从 activeTree=null 分支
+  // 起步（fast poll）。**必须在 await 前**，否则 iOS 在 configureAudioSession
+  // 的 ~300ms 里重建 keyboard VC，新树会读到还没被清掉的上一轮 T_tap.ID
+  // → L3 进 slow poll → 用户感觉"卡死"。（Stage 4 hygiene 修复在 v2 cold-start
+  // 路径的 recurrence 修复，见 memory/feedback_ghost_keyboard_l1_l2_l3.md）
+  clearActiveTree()
   try {
     await configureAudioSession()
     log("BackgroundKeeper.keepAlive()")
@@ -178,16 +229,15 @@ async function startSession(): Promise<void> {
       return
     }
     clearAction()
-    // 归零 activeTree：新 session 起手，让所有键盘树从 activeTree=null
-    // 分支起步（fast poll），等用户下次 tap 再写入新的 TREE_ID。避免
-    // 上一轮残留的 TREE_ID 让新可见树被错误地判成 ghost 而进 slow poll。
-    clearActiveTree()
     clearError()
     clearErrorKind()
     clearRawText()
     clearFinalText()
     clearSttMs()
     clearPolishMs()
+    // 旧 warm 实例的 warmUntil 清掉（避免 handleCycleEnd 误判"回 warm"）；
+    // **warmDurationMs 不清** —— 那是用户的持久化时长偏好，跨重启保留。
+    clearWarmUntil()
     sessionActive = true
     workerCancelled = false
     writeState("armed")
@@ -216,6 +266,473 @@ async function teardownAudioSession(): Promise<void> {
   }
   sessionActive = false
   workerCancelled = true
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4.5b — warm 保持态核心
+// ---------------------------------------------------------------------------
+
+// LA update 节流门闸。worker tick 调这个就行，不直接用 activity.update。
+async function throttledActivityUpdate(
+  state: VBActivityState
+): Promise<void> {
+  if (warmActivity === null) return
+  const now = Date.now()
+  if (now - lastActivityUpdateAt < ACTIVITY_UPDATE_MIN_GAP_MS) return
+  lastActivityUpdateAt = now
+  try {
+    await warmActivity.update(state)
+  } catch (e) {
+    logErr("activity.update failed:", String(e))
+  }
+}
+
+// 启动静音 keeper recorder。warm 窗口内它必须一直活着（audio 背景模式 +
+// Live Activity 的官方组合要求有 active audio I/O）。
+//
+// **v2 架构下只在 `startWarmSession` 里调一次**（整个 warm 窗口唯一一次）。
+// handleCycleEnd 和 armFromWarm 不再调这个函数 —— v1 曾经在 handleCycleEnd
+// 里"重启 keeper"，实测 100% 失败（详见 memory/feedback_keyboard_warm_trigger_option_a.md
+// 的"v1 架构错误教训"）。v2 承认"stop 过的 recording 上下文无法重建"，
+// 改成 keeper 全程不停 + real recorder 与之并行。
+//
+// 下面的 setActive re-confirm + 文件清理 + 200ms retry 是从 v1 继承的防御措施；
+// 在 v2 的单次调用场景里 retry 基本不会触发，但保留无害。
+async function startWarmSilentKeeper(): Promise<boolean> {
+  if (warmSilentKeeper !== null) {
+    log("startWarmSilentKeeper: already running, skipping")
+    return true
+  }
+  const path = await buildWarmKeeperPath()
+  log("warmSilentKeeper path=", path)
+
+  // 清掉上一轮的文件，避免 AudioRecorder 初始化时碰到残留 header。
+  // iOS 的 AVAudioRecorder 理论上会覆盖，但实测偶发对 overwrite 不友好；
+  // 一次 remove 更保险，FileManager.remove 不存在时自己吞异常。
+  try {
+    await FileManager.remove(path)
+    log("warmSilentKeeper: removed stale file")
+  } catch {
+    // 文件不存在 / 删不掉都当 noop
+  }
+
+  // 内部 attempt 函数：setActive(true) + create + record；record() false 返 false。
+  const attempt = async (label: string): Promise<boolean> => {
+    try {
+      await SharedAudioSession.setActive(true)
+      log(`warmSilentKeeper[${label}]: setActive(true) re-confirmed`)
+    } catch (e) {
+      logErr(
+        `warmSilentKeeper[${label}]: setActive(true) threw:`,
+        String(e)
+      )
+    }
+    let r: AudioRecorder
+    try {
+      r = await AudioRecorder.create(path, {
+        format: "MPEG4AAC",
+        sampleRate: 22050,
+        numberOfChannels: 1,
+        encoderAudioQuality: AVAudioQuality.low,
+      })
+    } catch (e) {
+      logErr(
+        `warmSilentKeeper[${label}]: AudioRecorder.create threw:`,
+        String(e)
+      )
+      return false
+    }
+    r.onError = (m: string) => {
+      logErr("warmSilentKeeper.onError:", m)
+    }
+    r.onFinish = (ok: boolean) => {
+      log("warmSilentKeeper.onFinish ok=", ok)
+    }
+    const ok = r.record()
+    log(
+      `warmSilentKeeper[${label}].record()=`,
+      ok,
+      "isRecording=",
+      r.isRecording
+    )
+    if (!ok) {
+      try {
+        r.dispose()
+      } catch {}
+      return false
+    }
+    warmSilentKeeper = r
+    return true
+  }
+
+  // First try
+  if (await attempt("try1")) return true
+
+  // 失败：等一小段让 iOS session 状态稳定，然后重试一次。200ms 是经验值，
+  // 对应 AVAudioSession 的内部状态切换时间（实测 iOS 18/17 都够用）。
+  logErr("warmSilentKeeper: try1 failed, waiting 200ms then retry")
+  await new Promise<void>((res) => setTimeout(res, 200))
+  if (await attempt("try2")) return true
+
+  logErr("warmSilentKeeper: try2 also failed, giving up")
+  return false
+}
+
+async function stopWarmSilentKeeper(): Promise<void> {
+  if (warmSilentKeeper === null) return
+  try {
+    warmSilentKeeper.stop()
+    log("warmSilentKeeper.stop OK")
+  } catch (e) {
+    logErr("warmSilentKeeper.stop:", String(e))
+  }
+  try {
+    warmSilentKeeper.dispose()
+  } catch (e) {
+    logErr("warmSilentKeeper.dispose:", String(e))
+  }
+  warmSilentKeeper = null
+}
+
+// 启动一个 warm 保持窗口。若 sessionActive 已经 true，只展期（更新
+// warmUntil / activity），不重开 session。否则走完整启动链：audio session
+// → keepAlive → silent keeper → LA → state=warm → scheduleWorker。
+//
+// 成功 return true；失败（静音 keeper 起不来等）会回滚并 return false。
+async function startWarmSession(durationMs: number): Promise<boolean> {
+  const newUntil = Date.now() + durationMs
+  log(
+    "startWarmSession · durationMs=",
+    durationMs,
+    "newWarmUntil=",
+    newUntil,
+    "sessionActive=",
+    sessionActive
+  )
+
+  // 已有 session：只展期 + update activity + 同步 warmUntil。
+  if (sessionActive) {
+    writeWarmDurationMs(durationMs)
+    writeWarmUntil(newUntil)
+    const cur = readState()
+    if (cur === "warm") {
+      await throttledActivityUpdate({
+        status: "warm",
+        remainingSec: Math.floor(durationMs / 1000),
+      })
+    }
+    return true
+  }
+
+  // Fresh start。
+  //
+  // **在任何 await 之前先清 activeTree**。理由：走到这里的路径包括"键盘 tap
+  // 触发 cold-start"，tap 刚往 Storage 写了 activeTree=T_tap.ID。configureAudioSession
+  // 往下 ~300ms 里 iOS 可能重建 keyboard VC，新树读到 T_tap.ID（不是自己）
+  // + state 还是 idle → L3 判 slow poll → 用户感到"卡死"。早清 → 窗口归零。
+  // MainView useEffect mount 也做了一次，这里是二道保险（belt+suspenders）。
+  clearActiveTree()
+  try {
+    await configureAudioSession()
+    await BackgroundKeeper.keepAlive()
+    log("startWarmSession: keepAlive OK")
+
+    // LA 必须在 silent keeper 之前拉起（Scripting 官方组合的语义是"有
+    // Live Activity 的前提下后台 audio 才能持久"；虽然顺序未必关键，
+    // 但按文档示例顺序来最保险）。
+    try {
+      const instance = VoiceboardWarmActivity()
+      const ok = await instance.start({
+        status: "warm",
+        remainingSec: Math.floor(durationMs / 1000),
+      })
+      log("warmActivity.start =>", ok)
+      warmActivity = instance
+      lastActivityUpdateAt = Date.now()
+    } catch (e) {
+      logErr("startWarmSession: activity.start failed:", String(e))
+      await BackgroundKeeper.stopKeepAlive().catch(() => {})
+      await SharedAudioSession.setActive(false).catch(() => {})
+      writeError(`LA 启动失败: ${String(e)}`)
+      writeErrorKind("setup")
+      return false
+    }
+
+    const keeperOk = await startWarmSilentKeeper()
+    if (!keeperOk) {
+      logErr("startWarmSession: silent keeper failed")
+      // 回滚 LA + audio session
+      try {
+        await warmActivity.end(
+          { status: "error", errorLabel: "启动失败" },
+          { dismissTimeInterval: 0 }
+        )
+      } catch {}
+      warmActivity = null
+      await BackgroundKeeper.stopKeepAlive().catch(() => {})
+      await SharedAudioSession.setActive(false).catch(() => {})
+      writeError("静音 keeper 启动失败")
+      writeErrorKind("record")
+      return false
+    }
+
+    // 清 session 脏数据（activeTree 已在函数顶清过，不重复）
+    clearAction()
+    clearError()
+    clearErrorKind()
+    clearRawText()
+    clearFinalText()
+    clearSttMs()
+    clearPolishMs()
+    clearSessionStartedAt()
+    clearSessionEndedAt()
+    writeFilePath("") // 置空，后续 arm 时覆盖
+
+    writeWarmDurationMs(durationMs)
+    writeWarmUntil(newUntil)
+
+    sessionActive = true
+    workerCancelled = false
+    doneStateSetAt = 0
+    cycleEndInFlight = false
+    writeState("warm")
+
+    scheduleWorker()
+    log(
+      "startWarmSession: OK · state=warm · warmUntil=",
+      newUntil
+    )
+    return true
+  } catch (e) {
+    logErr("startWarmSession failed:", String(e))
+    writeError(`startWarmSession: ${String(e)}`)
+    writeErrorKind("setup")
+    sessionActive = false
+    return false
+  }
+}
+
+// 结束整个 warm 会话：停 silent keeper、end LA、tear down audio session、
+// 清 warm 相关 storage、state=idle。调用场景：warm 到期、用户手动提前结束、
+// record 级 hard error。
+async function stopWarmSession(reason: string): Promise<void> {
+  log("stopWarmSession · reason=", reason)
+  await stopWarmSilentKeeper()
+
+  // 真实 recorder 如果还活着也要关（armed 期间被 stopWarmSession 打断的场景）
+  if (recorder !== null) {
+    try {
+      recorder.stop()
+    } catch (e) {
+      logErr("stopWarmSession: recorder.stop:", String(e))
+    }
+    try {
+      recorder.dispose()
+    } catch (e) {
+      logErr("stopWarmSession: recorder.dispose:", String(e))
+    }
+    recorder = null
+  }
+
+  if (warmActivity !== null) {
+    try {
+      const lastErr = readError()
+      const finalState: VBActivityState =
+        lastErr !== null
+          ? { status: "error", errorLabel: readErrorKind() ?? "错误" }
+          : { status: "warm", remainingSec: 0 }
+      await warmActivity.end(finalState, { dismissTimeInterval: 0 })
+      log("warmActivity.end OK (immediate dismiss)")
+    } catch (e) {
+      logErr("warmActivity.end:", String(e))
+    }
+    warmActivity = null
+  }
+
+  await teardownAudioSession()
+  clearWarmUntil()
+  // 注意：**不清 warmDurationMs**。持久化的用户偏好，跨 warm 结束要保留，
+  // 下次冷启动 / 打开主 app 时 duration picker 才能回填到用户上次选的档位。
+  doneStateSetAt = 0
+  cycleEndInFlight = false
+  writeState("idle")
+}
+
+// 一次录音 cycle（armed → transcribing → polishing → done）结束之后的
+// 分流：若 warmUntil 还在窗口内 → 回到 warm（restart silent keeper，update
+// activity），否则 → stopWarmSession 全量收尾。
+//
+// 被 workerTick 的 "done 且 keyboard 已消费" 分支调用；保证对每次 done
+// 只跑一次（cycleEndInFlight 互斥）。
+// v2（keeper 并行不停架构）：一次录音 cycle 结束后的分流。
+//
+// v1 在这里 restart keeper（失败），v2 完全不碰 keeper —— 整个 warm 窗口
+// 里 keeper 只在 startWarmSession 启动一次、stopWarmSession 停止一次。
+// 这里只做两件事：
+//   a) 软错误（stt/polish）或正常完成 + warm 未过期 → writeState("warm") + LA update
+//   b) 硬错误（record/setup）或 warm 已过期 → stopWarmSession 全量收尾
+async function handleCycleEnd(): Promise<void> {
+  if (cycleEndInFlight) {
+    log("handleCycleEnd: already in flight, skipping")
+    return
+  }
+  cycleEndInFlight = true
+  try {
+    const errKind = readErrorKind()
+    const warmUntil = readWarmUntil()
+    const now = Date.now()
+    const warmActive = warmUntil !== null && warmUntil > now
+
+    // Record / setup 级错误 = 保活机制本身坏了，强制 teardown 而不是继续 warm。
+    // STT / polish 级错误是上游服务问题，录音本身 OK，让用户在 warm 里重试。
+    const isHardError = errKind === "record" || errKind === "setup"
+
+    log(
+      "handleCycleEnd · errKind=",
+      errKind,
+      "warmActive=",
+      warmActive,
+      "isHardError=",
+      isHardError,
+      "keeper.isRecording=",
+      warmSilentKeeper?.isRecording ?? "null"
+    )
+
+    if (isHardError || !warmActive) {
+      await stopWarmSession(
+        isHardError ? `hard error (${errKind})` : "warmUntil expired"
+      )
+      return
+    }
+
+    // v2：keeper 从未 stop，直接保持 warm。不碰 warmSilentKeeper。
+    // 健全性：如果 keeper 真的意外死了，这就是架构不变式违反，
+    // 上层的 workerTick watchdog 会在下一 tick 检测到并 abort。
+    // 这里不做恢复尝试 —— 见 memory/feedback_keyboard_warm_trigger_option_a.md。
+    clearSessionStartedAt()
+    clearSessionEndedAt()
+    clearRawText()
+    clearFinalText()
+    doneStateSetAt = 0
+    writeState("warm")
+
+    const remainingSec = Math.max(0, Math.floor((warmUntil - now) / 1000))
+    await throttledActivityUpdate({
+      status: "warm",
+      remainingSec,
+    })
+    log(
+      "handleCycleEnd: back to warm · remainingSec=",
+      remainingSec,
+      "· keeper unchanged"
+    )
+  } finally {
+    cycleEndInFlight = false
+  }
+}
+
+// 处理 keyboard 的 "arm" action：warm → armed 的转换。停静音 keeper、
+// 起 real recorder、写 state=armed、LA 切 armed。
+// v2（keeper 并行不停架构）：处理 keyboard 的 "arm" action，warm → armed 转换。
+//
+// 关键差异 vs v1：
+//   v1 先 stop warmSilentKeeper 再 startRecorder（real）—— 这一步 stop 撕掉
+//   iOS AVAudioSession 的 recording 上下文，下一轮 handleCycleEnd 重启 keeper
+//   时会失败（详见 memory/feedback_keyboard_warm_trigger_option_a.md "v1 架构
+//   错误教训"）。
+//   v2 **不动 keeper**，让它继续录 warm_keeper.m4a。直接起 real recorder，
+//   两个 recorder 并行录音到各自文件。iOS 录音上下文始终有活的 recorder 撑
+//   着 → 永不撕掉 → 后续所有 create + record 都能成功。
+//
+// 依据：dts/global.d.ts:5005-5017 的 recorderOne/Two.record({atTime}) 官方
+// 示例就是两 recorder 并行。
+async function armFromWarm(): Promise<void> {
+  log("armFromWarm START (v2: parallel keeper)")
+  if (!sessionActive) {
+    logErr("armFromWarm: sessionActive=false, abort")
+    return
+  }
+  const state = readState()
+  if (state !== "warm") {
+    log("armFromWarm: state !=", "warm, got", state, "— skip")
+    return
+  }
+
+  // v2：不 stopWarmSilentKeeper！keeper 继续录，与 real recorder 并行。
+  // 这是整个架构的核心不变式（见 memory 教训）。
+  if (warmSilentKeeper === null || !warmSilentKeeper.isRecording) {
+    // 这本来不该发生（keeper 应全程活着）。但真遇到就 abort warm，
+    // 不要在这里尝试 restart（那正是 v1 栽跟头的地方）。
+    logErr(
+      "armFromWarm: BUG · warmSilentKeeper not alive when arm requested;",
+      "keeper=",
+      warmSilentKeeper === null ? "null" : "exists",
+      "isRecording=",
+      warmSilentKeeper?.isRecording
+    )
+    writeError("keeper 意外停止（iOS 可能回收了输入）")
+    writeErrorKind("record")
+    await stopWarmSession("armFromWarm keeper invariant violated")
+    return
+  }
+
+  // 起 real recorder（复用现有 startRecorder）。keeper 同时在录。
+  const ok = await startRecorder()
+  if (!ok) {
+    // real 起不来（mic 被其他 app 抢占？）。keeper 本来就没停，
+    // 不需要回滚 —— 直接保持 warm 让用户重试。
+    // 注：startRecorder 内部已经 writeError + writeErrorKind("record")
+    logErr("armFromWarm: startRecorder failed; staying in warm")
+    writeState("warm")
+    return
+  }
+
+  writeState("armed")
+  await throttledActivityUpdate({
+    status: "armed",
+    elapsedSec: 0,
+  })
+  log("armFromWarm: OK · state=armed · keeper still running in parallel")
+}
+
+// --------------------------------------------------------------------------
+// coldStartArmed：从键盘冷启动（或"开启录音会话"按钮的未来升级路径）过来，
+// 把 warm 全套 + real recorder 一次性拉齐，state → armed。
+//
+// v2.4.5 Issue #1 的修复：之前键盘 idle tap → Safari.openURL(run_single,
+// action=arm) → MainView useEffect → startSession → 仅 armed（无 warm 保持）。
+// 录完一次 cycle 结束就 teardown，用户下一次要再走一遍冷启动。这不符合
+// Typeless 的"一次激活保持 N 分钟"心智。
+//
+// v2.4.5 起：键盘冷启动等价于在主 app 点"激活保持 X min"+ 立刻开始录。
+// X 从用户持久化的 warmDurationMs 读，没有就用 DEFAULT_WARM_DURATION_MS（3 min）。
+// cycle 结束后 handleCycleEnd 自然回 warm 等下次 tap，跟主 app 激活的体验一致。
+// --------------------------------------------------------------------------
+async function coldStartArmed(): Promise<void> {
+  if (sessionActive) {
+    log("coldStartArmed: sessionActive already true, skipping")
+    return
+  }
+  const pref = readWarmDurationMs()
+  const dur = pref !== null && pref > 0 ? pref : DEFAULT_WARM_DURATION_MS
+  log(
+    "coldStartArmed START · durationMs=",
+    dur,
+    pref === null ? "(default)" : "(user pref)"
+  )
+
+  const warmOk = await startWarmSession(dur)
+  if (!warmOk) {
+    logErr("coldStartArmed: startWarmSession failed, abort")
+    return
+  }
+
+  // state 现在是 warm，warmActivity + warmSilentKeeper 已经跑着。
+  // 直接进入 armed。armFromWarm 内部会检查 state==="warm" + sessionActive。
+  await armFromWarm()
+  // 到这里，如果 armFromWarm 成功 → state=armed；失败（startRecorder 返回
+  // false）→ state 回到 warm（用户可以从主 app 看到"保持中"，下次再点尝试）。
+  log("coldStartArmed END · state=", readState())
 }
 
 // Unified error finalizer. Every failure path in stopAndTranscribe funnels
@@ -359,6 +876,11 @@ async function stopAndTranscribe(): Promise<void> {
   // 1. stop recorder synchronously; do NOT tear down audio session yet —
   //    we want the fetch below to keep running even after Scripting goes
   //    to background once the user switches back to the host app.
+  //
+  // Stage 4.5b：audio session / BackgroundKeeper / Live Activity 也都留着
+  //   ——  所有的 session teardown 决策延后到 handleCycleEnd 里基于 warmUntil
+  //   判断。这样 warm 窗口还活着时一次录音完就自然回 warm，不会因为中间
+  //   teardown 了 session 而要再冷启动。
   const path = readFilePath()
   if (recorder !== null) {
     try {
@@ -378,15 +900,40 @@ async function stopAndTranscribe(): Promise<void> {
 
   // 2. enter STT phase
   writeState("transcribing")
+  await throttledActivityUpdate({ status: "transcribing" })
   log("state=transcribing")
 
+  // ---- 以下各终点都要走同一条尾路：
+  //        writeState("done") + doneStateSetAt = now + update activity。
+  //      worker tick 会检测到 done（并给 keyboard 消费窗口）后调用
+  //      handleCycleEnd，后者决定是回 warm 还是 stopWarmSession。
+  //      record / setup 级错误由 handleCycleEnd 自己识别 errKind 做 hard teardown。
+
+  // Setup 级错误：路径丢失 / key 缺失 —— 会话还没真正能进行，都标
+  // errorKind="setup"，handleCycleEnd 会走 hard teardown 分支。
   if (path === null) {
-    await abort("setup", "录音文件路径丢失")
+    log("stopAndTranscribe: path missing")
+    writeError("录音文件路径丢失")
+    writeErrorKind("setup")
+    writeState("done")
+    doneStateSetAt = Date.now()
+    await throttledActivityUpdate({
+      status: "error",
+      errorLabel: "准备失败",
+    })
     return
   }
   const key = readScribeKey()
   if (key === null || key.length === 0) {
-    await abort("setup", "缺少 ElevenLabs key")
+    log("stopAndTranscribe: scribe key missing")
+    writeError("缺少 ElevenLabs key")
+    writeErrorKind("setup")
+    writeState("done")
+    doneStateSetAt = Date.now()
+    await throttledActivityUpdate({
+      status: "error",
+      errorLabel: "准备失败",
+    })
     return
   }
 
@@ -397,7 +944,14 @@ async function stopAndTranscribe(): Promise<void> {
   } catch (e) {
     const msg = String((e as Error)?.message ?? e)
     logErr("transcribe failed:", msg)
-    await abort("stt", msg)
+    writeError(msg)
+    writeErrorKind("stt")
+    writeState("done")
+    doneStateSetAt = Date.now()
+    await throttledActivityUpdate({
+      status: "error",
+      errorLabel: "转录失败",
+    })
     return
   }
 
@@ -406,23 +960,31 @@ async function stopAndTranscribe(): Promise<void> {
   if (openaiKey === null || openaiKey.length === 0) {
     log("no OpenAI key · skipping polish · state=done with rawText")
     writeState("done")
-    await teardownAudioSession()
+    doneStateSetAt = Date.now()
     return
   }
   writeState("polishing")
+  await throttledActivityUpdate({ status: "polishing" })
   log("state=polishing")
   try {
     const polished = await polishWithOpenAI(rawText, openaiKey)
     writeFinalText(polished)
     writeState("done")
+    doneStateSetAt = Date.now()
     log("polish ok · state=done · keyboard will consume finalText")
-    await teardownAudioSession()
   } catch (e) {
     const msg = String((e as Error)?.message ?? e)
     logErr("polish failed:", msg)
     // rawText 留在 storage — 键盘优先级是 finalText > rawText > errorPlaceholder，
     // 所以润色失败时用户仍然会看到未润色的原文插入，而不是错误占位。
-    await abort("polish", msg)
+    writeError(msg)
+    writeErrorKind("polish")
+    writeState("done")
+    doneStateSetAt = Date.now()
+    await throttledActivityUpdate({
+      status: "error",
+      errorLabel: "润色失败",
+    })
   }
 }
 
@@ -437,6 +999,25 @@ async function resetToIdle(): Promise<void> {
     } catch {}
     recorder = null
   }
+  // Stage 4.5b：也要拆掉 warm 相关资源。顺序与 stopWarmSession 一致。
+  if (warmSilentKeeper !== null) {
+    try {
+      warmSilentKeeper.stop()
+    } catch {}
+    try {
+      warmSilentKeeper.dispose()
+    } catch {}
+    warmSilentKeeper = null
+  }
+  if (warmActivity !== null) {
+    try {
+      await warmActivity.end(
+        { status: "warm", remainingSec: 0 },
+        { dismissTimeInterval: 0 }
+      )
+    } catch {}
+    warmActivity = null
+  }
   try {
     await BackgroundKeeper.stopKeepAlive()
   } catch {}
@@ -445,6 +1026,9 @@ async function resetToIdle(): Promise<void> {
   } catch {}
   sessionActive = false
   workerCancelled = true
+  doneStateSetAt = 0
+  cycleEndInFlight = false
+  lastActivityUpdateAt = 0
   clearAction()
   // 关键：清空 activeTree。否则上一轮的 TREE_ID 残留在 storage 里，
   // 下一次进宿主 app 后新可见的键盘树读到非空 activeTree 且不等于自己，
@@ -458,6 +1042,10 @@ async function resetToIdle(): Promise<void> {
   clearErrorKind()
   clearSttMs()
   clearPolishMs()
+  // Stage 4.5b：warm 会话标记归零。
+  clearWarmUntil()
+  // 注意：**不清 warmDurationMs**。"清除状态"重置的是 session 运行时状态，
+  // 不是用户配置。时长偏好持久化，用户下次激活时 duration picker 回显。
   writeState("idle")
 }
 
@@ -469,25 +1057,120 @@ function scheduleWorker(): void {
   })
 }
 
+// Worker tick：每 400ms 跑一次。4.5b 之后不只看 action，还要做状态机的
+// 周期性检查（warmUntil 过期、armed elapsed 更新、done 到 warm/idle 的
+// 推进、warm 窗口里的 silent keeper watchdog）。
 async function workerTick(): Promise<void> {
   writeHeartbeat()
   const action = readAction()
-  if (!action) return
   const state = readState()
-  log("worker tick · action=", action, "state=", state)
 
+  // ---- 1. Action handling ------------------------------------------------
   if (action === "stop") {
     clearAction()
-    if (state !== "armed") {
-      log("stop ignored · state not armed")
+    log("worker · stop · state=", state)
+    if (state === "armed") {
+      await stopAndTranscribe()
       return
     }
-    await stopAndTranscribe()
+    log("stop ignored · state not armed")
+    return
+  }
+  if (action === "arm") {
+    clearAction()
+    log("worker · arm · state=", state)
+    if (state === "warm") {
+      await armFromWarm()
+      return
+    }
+    log("arm ignored · state not warm")
+    return
+  }
+  if (action !== null) {
+    log("worker · unknown action, clearing:", action)
+    clearAction()
+  }
+
+  // ---- 2. Periodic state maintenance ------------------------------------
+  // 2a. warm：warmUntil 过期 → stopWarmSession；否则刷新 LA remainingSec；
+  //           v2 watchdog：keeper 不变式违反 → 直接 abort（不尝试恢复）。
+  if (state === "warm") {
+    const warmUntil = readWarmUntil()
+    const now = Date.now()
+    if (warmUntil !== null && now >= warmUntil) {
+      log("worker · warm expired · warmUntil=", warmUntil)
+      await stopWarmSession("warmUntil expired")
+      return
+    }
+    // v2 watchdog：warm 窗口里 keeper 必须一直在录。如果这个不变式被违反
+    // （iOS 杀了 keeper / 硬件回收 / 内存压力），不要尝试 restart —— v1 已经
+    // 证明"stop 过的 session recording 重启几乎必然失败"。直接 abort + teardown。
+    // 这是 v2 与 v1 最核心的分歧：承认失败而不是假装能恢复。
+    if (warmSilentKeeper === null || !warmSilentKeeper.isRecording) {
+      logErr(
+        "worker · warm · keeper invariant violated (keeper=",
+        warmSilentKeeper === null ? "null" : "exists",
+        "isRecording=",
+        warmSilentKeeper?.isRecording,
+        "); aborting warm"
+      )
+      writeError("保持静音 keeper 意外中断")
+      writeErrorKind("record")
+      await stopWarmSession("keeper watchdog invariant violation")
+      return
+    }
+    // LA 刷新 remainingSec（节流 1s）
+    if (warmUntil !== null) {
+      const remainingSec = Math.max(
+        0,
+        Math.floor((warmUntil - now) / 1000)
+      )
+      await throttledActivityUpdate({ status: "warm", remainingSec })
+    }
     return
   }
 
-  log("unknown action, clearing")
-  clearAction()
+  // 2b. armed：LA 刷新 elapsedSec（节流 1s）。
+  if (state === "armed") {
+    const startedAt = readSessionStartedAt()
+    if (startedAt !== null) {
+      const elapsedSec = (Date.now() - startedAt) / 1000
+      await throttledActivityUpdate({ status: "armed", elapsedSec })
+    }
+    return
+  }
+
+  // 2c. done：等 keyboard 消费（rawText/finalText 清空）或者 3s 超时兜底，
+  //           然后调 handleCycleEnd 把 session 推向 warm 或 idle。
+  //           至少等 1s 给 keyboard 400ms poll 跑两轮。
+  if (state === "done") {
+    if (doneStateSetAt === 0) {
+      // 异常：state=done 但没记录何时进入的 —— 旧 session 残留？补记账并
+      // 让下一轮正常走。
+      doneStateSetAt = Date.now()
+      return
+    }
+    const sinceDone = Date.now() - doneStateSetAt
+    if (sinceDone < 1000) return // 给 keyboard 消费窗口
+
+    const rawText = readRawText()
+    const finalText = readFinalText()
+    const consumed = rawText === null && finalText === null
+    const timedOut = sinceDone > 3000
+
+    if (consumed || timedOut) {
+      log(
+        "worker · done → cycle end · consumed=",
+        consumed,
+        "timedOut=",
+        timedOut,
+        "sinceDone=",
+        sinceDone
+      )
+      await handleCycleEnd()
+    }
+    return
+  }
 }
 
 async function foregroundTestRecord(): Promise<void> {
@@ -836,13 +1519,81 @@ function MainView() {
   const [openAIKeyDraft, setOpenAIKeyDraft] = useState<string>(
     readOpenAIKey() ?? ""
   )
+  // Stage 4.5b — duration picker 当前选择。默认 3 min；若用户之前用过
+  // 其他档位就读回 warmDurationMs 作为初值（组件 mount 时一次性）。
+  const [warmPickMinutes, setWarmPickMinutes] = useState<number>(() => {
+    const prev = readWarmDurationMs()
+    if (prev !== null && prev > 0) return Math.round(prev / 60000)
+    return 3
+  })
 
   useEffect(() => {
     const q = Script.queryParameters ?? {}
     log("mount · queryParameters=", JSON.stringify(q))
+
+    // L1-style 卡死防御（Stage 4 的 hygiene 教训在 v2 cold-start 路径的 recurrence 修复）：
+    // 任何走到 MainView mount 的路径 —— 无论是用户从主 app 打开、键盘 tap
+    // 触发的 run_single cold-start、还是 run + onResume —— 都必然意味着
+    // "keyboard 侧可能刚写过的 activeTree=T_tap.ID 已经作废了"（tapping tree
+    // 马上或已经被 iOS 在 VC 切换时销毁）。**如果这个 T_tap.ID 滞留在 Storage
+    // 里，且新实例进入 armed/warm 的 ~300ms 里 iOS 又重建了 keyboard VC，
+    // 新树 T_new2 会读到 activeTree=T_tap.ID（不是自己）+ state 还来得及
+    // 更新成 idle → L3 shouldFast 判 false → 5s slow poll → 用户感知"卡死"**。
+    //
+    // 修法：mount 就无条件清 activeTree，把窗口从 ~300ms 缩到 0ms。
+    // startWarmSession / startSession 内部在 await 前也各自再清一次（belt+suspenders）。
+    clearActiveTree()
+
+    // Stage 4.5b — 新实例启动时的陈旧 warm 状态清理。
+    //
+    // 场景：iOS 杀掉 warm 中的 Scripting（内存压力 / 用户上划）→ Storage
+    // 里 state=warm / warmUntil=未来 / activeTree=某个死掉的 TREE_ID 全部
+    // 残留。此时 sessionActive 是模块级 let 初值 false，即我们在内存里
+    // 没有任何 warm 上下文（warmSilentKeeper / warmActivity 都 null）。
+    //
+    // 如果不清理，UI 会显示"保持中，剩余 XX:XX"但麦克风根本不通；键盘
+    // tap 会走 warm fast-path（openURL run），但因为实例其实是新的、
+    // 入口会被重跑、startSession 会被调（因为 queryParameters.action=arm），
+    // 场面很乱。
+    //
+    // 策略：mount 时若 sessionActive=false（新实例）且 Storage 说 warm，
+    // 直接清掉 warm 残留 + state=idle。让用户（或 coldStartArmed）重新激活。
+    // 注：coldStartArmed 读的是 warmDurationMs（用户持久化偏好），此处**不清**。
+    if (!sessionActive) {
+      const staleState = readState()
+      const staleWarmUntil = readWarmUntil()
+      if (staleState !== "idle" || staleWarmUntil !== null) {
+        log(
+          "mount · stale session signals from prior instance, clearing: state=",
+          staleState,
+          "warmUntil=",
+          staleWarmUntil
+        )
+        clearAction()
+        // activeTree 上面已经清了，这里不重复
+        clearWarmUntil()
+        // 注意：**不清 warmDurationMs**。用户在主 app 配置的时长是持久化偏好，
+        // 跨重启 / 清理 / run_single 重建实例都要保留。duration picker 的
+        // useState 初值会读它回填，coldStartArmed 也会读它作为激活时长。
+        // rawText/finalText 若还有待消费的内容先留着 —— 如果此时键盘
+        // 其实还在目标 app 里准备 consume done，别把 payload 剪了。
+        // startSession 路径会在 arm 时清，这里不动。
+        clearSessionStartedAt()
+        clearSessionEndedAt()
+        writeState("idle")
+      }
+    }
+
     if (q.action === "arm") {
-      log("auto-arm from URL scheme")
-      startSession()
+      // v2.4.5 Issue #1 修复：URL scheme cold-start 不再走老 startSession
+      // （只到 armed、无保持），改走 coldStartArmed —— startWarmSession 先
+      // 把 warm 全套拉起来（keeper + LA + warmUntil + keepAlive）再
+      // armFromWarm 直接进入 armed。录完一次 cycle 后 handleCycleEnd 会
+      // 自然回到 warm，等用户下一次 tap。
+      // 这样"从键盘激活"和"从主 app 点激活保持"就等价了，用户的 warmDurationMs
+      // 偏好在两条路径里一致生效。
+      log("auto-arm from URL scheme → coldStartArmed")
+      coldStartArmed()
     }
     let cancelled = false
     const refresh = () => {
@@ -868,6 +1619,8 @@ function MainView() {
   const finalText = readFinalText()
   const sttMs = readSttMs()
   const polishMs = readPolishMs()
+  const warmUntil = readWarmUntil()
+  const warmDurationMs = readWarmDurationMs()
   const q = Script.queryParameters ?? {}
   const qpStr = JSON.stringify(q)
   const logEntries = readLog()
@@ -887,6 +1640,16 @@ function MainView() {
       : null
   const heartbeatAgo =
     heartbeat !== null ? ((now - heartbeat) / 1000).toFixed(1) : "—"
+  // Stage 4.5b — warm 剩余秒数 / mm:ss 显示
+  const warmRemainingSec =
+    warmUntil !== null ? Math.max(0, Math.floor((warmUntil - now) / 1000)) : 0
+  const warmRemainingMMSS = (() => {
+    const s = warmRemainingSec
+    const m = Math.floor(s / 60)
+    const ss = s % 60
+    const pad = (n: number) => (n < 10 ? `0${n}` : String(n))
+    return `${pad(m)}:${pad(ss)}`
+  })()
 
   const onEnd = async () => {
     await resetToIdle()
@@ -895,7 +1658,9 @@ function MainView() {
   }
 
   const statusLabel =
-    state === "armed" && recordingSec !== null
+    state === "warm"
+      ? `warm · 保持中 · 剩余 ${warmRemainingMMSS}`
+      : state === "armed" && recordingSec !== null
       ? `armed · 录音中 ${recordingSec}s`
       : state === "transcribing"
       ? "transcribing · 转录中…"
@@ -913,6 +1678,8 @@ function MainView() {
     | "label" =
     err !== null
       ? "systemRed"
+      : state === "warm"
+      ? "systemBlue"
       : state === "armed"
       ? "orange"
       : state === "transcribing" || state === "polishing"
@@ -1012,6 +1779,71 @@ function MainView() {
               }}
             />
           </VStack>
+
+          {/* ---------------------------------------------------------------
+               Stage 4.5b — 保持麦克风（warm 会话面板）
+               idle: 显示 duration picker + 激活按钮
+               warm: 显示倒计时 + 提前结束
+               其他态（armed/transcribing/polishing/done）：隐藏，不占位
+             --------------------------------------------------------------- */}
+          {state === "idle" || state === "warm" ? (
+            <VStack spacing={8} alignment="leading">
+              <Text font="caption" foregroundStyle="secondaryLabel">
+                保持麦克风
+              </Text>
+              {state === "idle" ? (
+                <VStack spacing={6} alignment="leading">
+                  <Text font="footnote" foregroundStyle="secondaryLabel">
+                    激活后 Scripting 会在后台保持麦克风就绪；在选定时长内，
+                    你在任意 App 点键盘的录音按钮都可以直接录音。
+                  </Text>
+                  <HStack spacing={6}>
+                    {[1, 3, 5, 15, 30, 60].map((m) => (
+                      <Button
+                        key={`warm-pick-${m}`}
+                        title={
+                          warmPickMinutes === m
+                            ? `✓ ${m}min`
+                            : `${m}min`
+                        }
+                        action={() => {
+                          setWarmPickMinutes(m)
+                          setTick((t) => t + 1)
+                        }}
+                      />
+                    ))}
+                  </HStack>
+                  <Button
+                    title={`🔊 激活保持 ${warmPickMinutes} min`}
+                    action={async () => {
+                      const ok = await startWarmSession(
+                        warmPickMinutes * 60 * 1000
+                      )
+                      log("startWarmSession tap result:", ok)
+                      setTick((t) => t + 1)
+                    }}
+                  />
+                </VStack>
+              ) : (
+                <VStack spacing={6} alignment="leading">
+                  <Text font="title" foregroundStyle="systemBlue">
+                    剩余 {warmRemainingMMSS}
+                  </Text>
+                  <Text font="footnote" foregroundStyle="secondaryLabel">
+                    切到任意 App，点键盘 🎙 录音 即可直接录音；
+                    完成后自动回到保持态等待下一次。
+                  </Text>
+                  <Button
+                    title="✕ 提前结束"
+                    action={async () => {
+                      await stopWarmSession("user early stop")
+                      setTick((t) => t + 1)
+                    }}
+                  />
+                </VStack>
+              )}
+            </VStack>
+          ) : null}
 
           {state === "armed" ? (
             <Text foregroundStyle="secondaryLabel">
