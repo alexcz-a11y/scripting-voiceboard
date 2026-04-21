@@ -35,6 +35,7 @@ function logErr(...args: unknown[]): void {
 
 const POLL_MS = 400
 const COLD_START_WAIT_MS = 3000
+const DEBUG = true
 
 type Mode = "idle" | "recording" | "done" | "other"
 
@@ -159,11 +160,11 @@ function VoiceboardKeyboard() {
   const micLabel = (() => {
     switch (mode) {
       case "idle":
-        return "🎙"
+        return "🎙 开始"
       case "recording":
-        return "■"
+        return "■ 停止"
       case "done":
-        return "…"
+        return "… 处理中"
       default:
         return "?"
     }
@@ -235,15 +236,17 @@ function VoiceboardKeyboard() {
         <Spacer />
       </HStack>
 
-      {openURLResult !== null ? (
+      {DEBUG && openURLResult !== null ? (
         <Text font="caption" foregroundStyle="secondaryLabel">
           {openURLResult}
         </Text>
       ) : null}
 
-      <Text font="caption" foregroundStyle="secondaryLabel">
-        mode={mode} · state={state} · tick={tick}
-      </Text>
+      {DEBUG ? (
+        <Text font="caption" foregroundStyle="secondaryLabel">
+          mode={mode} · state={state} · tick={tick}
+        </Text>
+      ) : null}
     </VStack>
   )
 }
