@@ -11,11 +11,13 @@ import {
 
 import {
   clearFilePath,
+  clearRawText,
   clearSessionEndedAt,
   clearSessionStartedAt,
   readError,
   readFilePath,
   readHeartbeat,
+  readRawText,
   readSessionEndedAt,
   readSessionStartedAt,
   readState,
@@ -84,6 +86,7 @@ function VoiceboardKeyboard() {
   const filePath = readFilePath()
   const err = readError()
   const heartbeat = readHeartbeat()
+  const rawText = readRawText()
   const now = Date.now()
 
   const mode = classify(state)
@@ -99,6 +102,11 @@ function VoiceboardKeyboard() {
   // actually attached to a text input. Ghost instances (backgrounded or in
   // an app with no focused text field) would otherwise race and swallow the
   // done state silently.
+  //
+  // Payload priority:
+  //   1. err  → `[转录失败: <msg>]`
+  //   2. rawText (Scribe 输出) → 直接插入
+  //   3. fallback → `[录音 X.Xs · <m4a path>]`（v1 占位，便于调试）
   useEffect(() => {
     if (mode !== "done") return
     const attached = isKeyboardAttachedToInput()
@@ -106,16 +114,33 @@ function VoiceboardKeyboard() {
       log("done seen but keyboard not attached to input; skipping consume")
       return
     }
-    if (filePath === null || sessionStartedAt === null) {
-      log("done but data incomplete", { filePath, sessionStartedAt })
+    let payload: string | null = null
+    if (err !== null && err.length > 0) {
+      payload = `[转录失败: ${err}]`
+    } else if (rawText !== null && rawText.length > 0) {
+      payload = rawText
+    } else if (filePath !== null && sessionStartedAt !== null) {
+      const dur =
+        sessionEndedAt !== null
+          ? ((sessionEndedAt - sessionStartedAt) / 1000).toFixed(1)
+          : "?"
+      payload = `[录音 ${dur}s · ${filePath}]`
+    }
+    if (payload === null) {
+      log("done but no payload available; skipping", {
+        filePath,
+        sessionStartedAt,
+        rawText,
+        err,
+      })
       return
     }
-    const dur =
-      sessionEndedAt !== null
-        ? ((sessionEndedAt - sessionStartedAt) / 1000).toFixed(1)
-        : "?"
-    const payload = `[录音 ${dur}s · ${filePath}]`
-    log("done · attached · insertText payload=", payload)
+    log(
+      "done · attached · insertText len=",
+      payload.length,
+      "preview=",
+      payload.slice(0, 80)
+    )
     CustomKeyboard.playInputClick()
     try {
       CustomKeyboard.insertText(payload)
@@ -123,12 +148,14 @@ function VoiceboardKeyboard() {
     } catch (e) {
       logErr("insertText threw:", String(e))
     }
+    clearRawText()
     clearFilePath()
     clearSessionStartedAt()
     clearSessionEndedAt()
+    // 注：err 不在这里清，留在主 app 错误区供用户查看；下次 startSession 会清
     writeState("idle")
     log("state=idle · session fully consumed")
-  }, [mode, filePath, sessionStartedAt, sessionEndedAt])
+  }, [mode, filePath, sessionStartedAt, sessionEndedAt, rawText, err])
 
   const coldStartTimedOut =
     coldStartAt !== null &&

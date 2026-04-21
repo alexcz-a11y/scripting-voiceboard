@@ -17,9 +17,9 @@ import {
   buildRecordingPath,
   clearAction,
   clearError,
-  clearFilePath,
   clearLog,
   clearOpenAIKey,
+  clearRawText,
   clearScribeKey,
   clearSessionEndedAt,
   clearSessionStartedAt,
@@ -31,6 +31,7 @@ import {
   readHeartbeat,
   readLog,
   readOpenAIKey,
+  readRawText,
   readScribeKey,
   readSessionEndedAt,
   readSessionStartedAt,
@@ -41,6 +42,7 @@ import {
   writeFilePath,
   writeHeartbeat,
   writeOpenAIKey,
+  writeRawText,
   writeScribeKey,
   writeSessionEndedAt,
   writeSessionStartedAt,
@@ -153,6 +155,7 @@ async function startSession(): Promise<void> {
     }
     clearAction()
     clearError()
+    clearRawText()
     sessionActive = true
     workerCancelled = false
     writeState("armed")
@@ -165,22 +168,7 @@ async function startSession(): Promise<void> {
   }
 }
 
-async function finalizeRecordingAndMarkDone(): Promise<void> {
-  log("finalizeRecordingAndMarkDone")
-  if (recorder !== null) {
-    try {
-      recorder.stop()
-      log("recorder.stop OK")
-    } catch (e) {
-      logErr("recorder.stop:", String(e))
-    }
-    try {
-      recorder.dispose()
-    } catch (e) {
-      logErr("recorder.dispose:", String(e))
-    }
-    recorder = null
-  }
+async function teardownAudioSession(): Promise<void> {
   try {
     await BackgroundKeeper.stopKeepAlive()
     log("stopKeepAlive OK")
@@ -195,9 +183,95 @@ async function finalizeRecordingAndMarkDone(): Promise<void> {
   }
   sessionActive = false
   workerCancelled = true
+}
+
+async function transcribeWithScribe(
+  filePath: string,
+  key: string
+): Promise<string> {
+  log("scribe POST · file=", filePath)
+  const data = Data.fromFile(filePath)
+  if (data === null) throw new Error("Data.fromFile returned null")
+  const form = new FormData()
+  form.append("file", data, "audio/mp4", "rec.m4a")
+  form.append("model_id", "scribe_v2")
+  form.append("language_code", "zho")
+  form.append("tag_audio_events", "false")
+  const t0 = Date.now()
+  const res = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
+    method: "POST",
+    headers: { "xi-api-key": key },
+    body: form,
+  })
+  const elapsedMs = Date.now() - t0
+  log("scribe response", res.status, `${elapsedMs}ms`)
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "<no body>")
+    throw new Error(
+      `scribe ${res.status}: ${errBody.slice(0, 200)}`
+    )
+  }
+  const json = (await res.json()) as { text?: string }
+  const text = String(json?.text ?? "")
+  log("scribe text len=", text.length, "preview=", text.slice(0, 60))
+  if (text.length === 0) throw new Error("scribe returned empty text")
+  return text
+}
+
+async function stopAndTranscribe(): Promise<void> {
+  log("---- stopAndTranscribe ----")
+  // 1. stop recorder synchronously; do NOT tear down audio session yet —
+  //    we want the fetch below to keep running even after Scripting goes
+  //    to background once the user switches back to the host app.
+  const path = readFilePath()
+  if (recorder !== null) {
+    try {
+      recorder.stop()
+      log("recorder.stop OK")
+    } catch (e) {
+      logErr("recorder.stop:", String(e))
+    }
+    try {
+      recorder.dispose()
+    } catch (e) {
+      logErr("recorder.dispose:", String(e))
+    }
+    recorder = null
+  }
   writeSessionEndedAt(Date.now())
-  writeState("done")
-  log("state=done · keyboard will consume")
+
+  // 2. enter STT phase
+  writeState("transcribing")
+  log("state=transcribing")
+
+  if (path === null) {
+    logErr("missing recording file path")
+    writeError("录音文件路径丢失")
+    writeState("done")
+    await teardownAudioSession()
+    return
+  }
+  const key = readScribeKey()
+  if (key === null || key.length === 0) {
+    logErr("missing ElevenLabs key")
+    writeError("缺少 ElevenLabs key")
+    writeState("done")
+    await teardownAudioSession()
+    return
+  }
+
+  try {
+    const text = await transcribeWithScribe(path, key)
+    writeRawText(text)
+    writeState("done")
+    log("STT ok · state=done · keyboard will consume rawText")
+  } catch (e) {
+    const msg = String((e as Error)?.message ?? e)
+    logErr("transcribe failed:", msg)
+    writeError(`STT: ${msg}`)
+    writeState("done")
+  }
+  await teardownAudioSession()
 }
 
 async function resetToIdle(): Promise<void> {
@@ -222,6 +296,7 @@ async function resetToIdle(): Promise<void> {
   clearAction()
   clearSessionStartedAt()
   clearSessionEndedAt()
+  clearRawText()
   writeState("idle")
 }
 
@@ -246,7 +321,7 @@ async function workerTick(): Promise<void> {
       log("stop ignored · state not armed")
       return
     }
-    await finalizeRecordingAndMarkDone()
+    await stopAndTranscribe()
     return
   }
 
@@ -267,7 +342,7 @@ async function foregroundTestRecord(): Promise<void> {
   }
   log("recording for 2s in foreground…")
   await new Promise<void>((res) => setTimeout(() => res(), 2000))
-  await finalizeRecordingAndMarkDone()
+  await stopAndTranscribe()
   log("---- foregroundTestRecord END · state=done ----")
 }
 
@@ -308,6 +383,7 @@ function MainView() {
   const filePath = readFilePath()
   const err = readError()
   const heartbeat = readHeartbeat()
+  const rawText = readRawText()
   const q = Script.queryParameters ?? {}
   const qpStr = JSON.stringify(q)
   const logEntries = readLog()
@@ -439,39 +515,6 @@ function MainView() {
                 setTick((v) => v + 1)
               }}
             />
-            <Text font="caption" foregroundStyle="secondaryLabel">
-              联调（Stage 1 临时，下阶段删除）· 测完按"清除状态"拆 audio session
-            </Text>
-            <HStack spacing={8}>
-              <Button
-                title="→ transcribing"
-                action={() => {
-                  writeState("transcribing")
-                  setTick((v) => v + 1)
-                }}
-              />
-              <Button
-                title="→ polishing"
-                action={() => {
-                  writeState("polishing")
-                  setTick((v) => v + 1)
-                }}
-              />
-              <Button
-                title="→ done (静态)"
-                action={() => {
-                  // 联调用：只让键盘看到 done 这个 UI 状态，不触发 insertText 消费。
-                  // 清掉数据，keyboard 的 done 分支会因为 filePath===null 而停在
-                  // 「等待插入…」不动；用「清除状态」回 idle 即可。
-                  clearFilePath()
-                  clearSessionStartedAt()
-                  clearSessionEndedAt()
-                  clearError()
-                  writeState("done")
-                  setTick((v) => v + 1)
-                }}
-              />
-            </HStack>
           </VStack>
 
           {state === "armed" ? (
@@ -496,6 +539,15 @@ function MainView() {
                   ended at {sessionEndedAt}
                 </Text>
               ) : null}
+            </VStack>
+          ) : null}
+
+          {rawText !== null ? (
+            <VStack spacing={4} alignment="leading">
+              <Text font="caption" foregroundStyle="secondaryLabel">
+                Scribe 转录（rawText）
+              </Text>
+              <Text font="footnote">{rawText}</Text>
             </VStack>
           ) : null}
 
