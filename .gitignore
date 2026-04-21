@@ -24,6 +24,9 @@ dts/
 # Local reference docs (Scripting llms-full). Too large to ship in repo.
 reference/
 
+# Claude Code local guidance file — personal workspace, not source.
+CLAUDE.md
+
 # Secrets / local env
 .env
 .env.*
