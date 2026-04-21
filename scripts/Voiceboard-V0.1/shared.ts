@@ -8,10 +8,19 @@ export const K_SESSION_ENDED_AT = "vb:sessionEndedAt"
 export const K_ERROR = "vb:error"
 export const K_LAST_HEARTBEAT = "vb:heartbeat"
 export const K_LOG = "vb:log"
+export const K_SCRIBE_KEY = "vb:scribeKey"
+export const K_OPENAI_KEY = "vb:openAIKey"
+export const K_RAW_TEXT = "vb:rawText"
+export const K_FINAL_TEXT = "vb:finalText"
 
 export const RECORDINGS_SUBDIR = "Voiceboard"
 
-export type VBState = "idle" | "armed" | "done"
+export type VBState =
+  | "idle"
+  | "armed"
+  | "transcribing"
+  | "polishing"
+  | "done"
 export type VBAction = "stop"
 
 const opts = { shared: true } as const
@@ -90,6 +99,54 @@ export function writeError(msg: string): void {
 
 export function clearError(): void {
   Storage.remove(K_ERROR, opts)
+}
+
+export function readScribeKey(): string | null {
+  return Storage.get<string>(K_SCRIBE_KEY, opts) ?? null
+}
+
+export function writeScribeKey(k: string): void {
+  Storage.set(K_SCRIBE_KEY, k, opts)
+}
+
+export function clearScribeKey(): void {
+  Storage.remove(K_SCRIBE_KEY, opts)
+}
+
+export function readOpenAIKey(): string | null {
+  return Storage.get<string>(K_OPENAI_KEY, opts) ?? null
+}
+
+export function writeOpenAIKey(k: string): void {
+  Storage.set(K_OPENAI_KEY, k, opts)
+}
+
+export function clearOpenAIKey(): void {
+  Storage.remove(K_OPENAI_KEY, opts)
+}
+
+export function readRawText(): string | null {
+  return Storage.get<string>(K_RAW_TEXT, opts) ?? null
+}
+
+export function writeRawText(t: string): void {
+  Storage.set(K_RAW_TEXT, t, opts)
+}
+
+export function clearRawText(): void {
+  Storage.remove(K_RAW_TEXT, opts)
+}
+
+export function readFinalText(): string | null {
+  return Storage.get<string>(K_FINAL_TEXT, opts) ?? null
+}
+
+export function writeFinalText(t: string): void {
+  Storage.set(K_FINAL_TEXT, t, opts)
+}
+
+export function clearFinalText(): void {
+  Storage.remove(K_FINAL_TEXT, opts)
 }
 
 export async function ensureRecordingsDir(): Promise<string> {

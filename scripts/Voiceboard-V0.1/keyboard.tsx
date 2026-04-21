@@ -37,12 +37,13 @@ const POLL_MS = 400
 const COLD_START_WAIT_MS = 3000
 const DEBUG = true
 
-type Mode = "idle" | "recording" | "done" | "other"
+type Mode = "idle" | "recording" | "processing" | "done" | "other"
 
 function classify(state: VBState): Mode {
   if (state === "idle") return "idle"
   if (state === "done") return "done"
   if (state === "armed") return "recording"
+  if (state === "transcribing" || state === "polishing") return "processing"
   return "other"
 }
 
@@ -150,8 +151,10 @@ function VoiceboardKeyboard() {
             : "?"
         return `录音中 · ${sec}s · 点击停止并插入`
       }
+      case "processing":
+        return state === "transcribing" ? "转录中…" : "润色中…"
       case "done":
-        return "处理中…"
+        return "等待插入…"
       default:
         return state
     }
@@ -163,14 +166,16 @@ function VoiceboardKeyboard() {
         return "🎙 开始"
       case "recording":
         return "■ 停止"
+      case "processing":
+        return state === "transcribing" ? "… 转录中" : "… 润色中"
       case "done":
-        return "… 处理中"
+        return "… 插入中"
       default:
         return "?"
     }
   })()
 
-  const micDisabled = mode === "done"
+  const micDisabled = mode === "done" || mode === "processing"
 
   const onMicTap = async () => {
     const rawState = readState()

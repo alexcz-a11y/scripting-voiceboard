@@ -5,6 +5,7 @@ import {
   NavigationStack,
   Script,
   ScrollView,
+  SecureField,
   Spacer,
   Text,
   useEffect,
@@ -16,7 +17,10 @@ import {
   buildRecordingPath,
   clearAction,
   clearError,
+  clearFilePath,
   clearLog,
+  clearOpenAIKey,
+  clearScribeKey,
   clearSessionEndedAt,
   clearSessionStartedAt,
   ensureRecordingsDir,
@@ -26,6 +30,8 @@ import {
   readFilePath,
   readHeartbeat,
   readLog,
+  readOpenAIKey,
+  readScribeKey,
   readSessionEndedAt,
   readSessionStartedAt,
   readState,
@@ -34,6 +40,8 @@ import {
   writeError,
   writeFilePath,
   writeHeartbeat,
+  writeOpenAIKey,
+  writeScribeKey,
   writeSessionEndedAt,
   writeSessionStartedAt,
   writeState,
@@ -267,6 +275,12 @@ function MainView() {
   const dismiss = Navigation.useDismiss()
   const [tick, setTick] = useState(0)
   const [bgActive, setBgActive] = useState<boolean | null>(null)
+  const [scribeKeyDraft, setScribeKeyDraft] = useState<string>(
+    readScribeKey() ?? ""
+  )
+  const [openAIKeyDraft, setOpenAIKeyDraft] = useState<string>(
+    readOpenAIKey() ?? ""
+  )
 
   useEffect(() => {
     const q = Script.queryParameters ?? {}
@@ -323,18 +337,32 @@ function MainView() {
   const statusLabel =
     state === "armed" && recordingSec !== null
       ? `armed · 录音中 ${recordingSec}s`
+      : state === "transcribing"
+      ? "transcribing · 转录中…"
+      : state === "polishing"
+      ? "polishing · 润色中…"
       : state === "done" && finalDurSec !== null
       ? `done · 时长 ${finalDurSec}s（等待键盘插入）`
       : state
 
-  const statusColor: "orange" | "systemGreen" | "systemRed" | "label" =
+  const statusColor:
+    | "orange"
+    | "systemGreen"
+    | "systemRed"
+    | "systemBlue"
+    | "label" =
     err !== null
       ? "systemRed"
       : state === "armed"
       ? "orange"
+      : state === "transcribing" || state === "polishing"
+      ? "systemBlue"
       : state === "done"
       ? "systemGreen"
       : "label"
+
+  const scribeKeySet = (readScribeKey() ?? "").length > 0
+  const openAIKeySet = (readOpenAIKey() ?? "").length > 0
 
   return (
     <NavigationStack>
@@ -348,6 +376,38 @@ function MainView() {
               已从键盘唤起 · 请切回刚才输入文字的 App 继续录音
             </Text>
           ) : null}
+
+          <VStack spacing={6} alignment="leading">
+            <Text font="caption" foregroundStyle="secondaryLabel">
+              ⚙ Keys
+            </Text>
+            <SecureField
+              title="ElevenLabs Scribe Key"
+              prompt="xi-api-key"
+              value={scribeKeyDraft}
+              onChanged={(v) => {
+                setScribeKeyDraft(v)
+                if (v.length > 0) writeScribeKey(v)
+                else clearScribeKey()
+                setTick((t) => t + 1)
+              }}
+            />
+            <SecureField
+              title="OpenAI Key"
+              prompt="sk-..."
+              value={openAIKeyDraft}
+              onChanged={(v) => {
+                setOpenAIKeyDraft(v)
+                if (v.length > 0) writeOpenAIKey(v)
+                else clearOpenAIKey()
+                setTick((t) => t + 1)
+              }}
+            />
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              scribe {scribeKeySet ? "✓" : "✗"} · openai{" "}
+              {openAIKeySet ? "✓" : "✗"}
+            </Text>
+          </VStack>
 
           <VStack spacing={4} alignment="leading">
             <Text font="caption" foregroundStyle="secondaryLabel">
@@ -379,6 +439,39 @@ function MainView() {
                 setTick((v) => v + 1)
               }}
             />
+            <Text font="caption" foregroundStyle="secondaryLabel">
+              联调（Stage 1 临时，下阶段删除）· 测完按"清除状态"拆 audio session
+            </Text>
+            <HStack spacing={8}>
+              <Button
+                title="→ transcribing"
+                action={() => {
+                  writeState("transcribing")
+                  setTick((v) => v + 1)
+                }}
+              />
+              <Button
+                title="→ polishing"
+                action={() => {
+                  writeState("polishing")
+                  setTick((v) => v + 1)
+                }}
+              />
+              <Button
+                title="→ done (静态)"
+                action={() => {
+                  // 联调用：只让键盘看到 done 这个 UI 状态，不触发 insertText 消费。
+                  // 清掉数据，keyboard 的 done 分支会因为 filePath===null 而停在
+                  // 「等待插入…」不动；用「清除状态」回 idle 即可。
+                  clearFilePath()
+                  clearSessionStartedAt()
+                  clearSessionEndedAt()
+                  clearError()
+                  writeState("done")
+                  setTick((v) => v + 1)
+                }}
+              />
+            </HStack>
           </VStack>
 
           {state === "armed" ? (
