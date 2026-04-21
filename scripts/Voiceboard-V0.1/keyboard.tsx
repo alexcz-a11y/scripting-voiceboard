@@ -40,6 +40,7 @@ function logErr(...args: unknown[]): void {
 }
 
 const POLL_MS = 400
+const SLOW_POLL_MS = 5000 // ghost 树降频到 5s/次，省 CPU/重渲染开销
 const COLD_START_WAIT_MS = 3000
 const DEBUG = true
 
@@ -77,18 +78,96 @@ function VoiceboardKeyboard() {
   const [coldStartAt, setColdStartAt] = useState<number | null>(null)
   const [openURLResult, setOpenURLResult] = useState<string | null>(null)
   const [prevMode, setPrevMode] = useState<Mode | null>(null)
+  // wakeRef holds a per-instance reference to the "wake from slow poll"
+  // function. onMicTap mutates wakeRef.wake to invoke it after writing the
+  // new activeTree id, so a ghost-mode tree that the user just tapped
+  // immediately switches to fast polling instead of waiting 5s.
+  const [wakeRef] = useState<{ wake: () => void }>(() => ({ wake: () => {} }))
 
+  // L3 (Stage 3.5, v2): self-suspending poll loop.
+  //
+  // First L3 attempt used `state==="idle" && !isKeyboardAttachedToInput()` as
+  // the ghost detector. It silently failed on device because ghost trees
+  // keep returning attached=true (their cached textBeforeCursor / proxy
+  // doesn't go null when iOS recreates the VC). Switching to the L2 signal:
+  // the only tree the user ever taps is the visible one, so its TREE_ID is
+  // the only one ever written into vb:activeTree. Any tree whose own TREE_ID
+  // doesn't match the storage value is reliably a ghost.
+  //
+  // Fast mode (POLL_MS=400ms) when ANY of:
+  //   - this tree is the user-active one (activeTree===TREE_ID)
+  //   - nobody has tapped yet (activeTree===null) — first-session compat
+  //   - a session is running (state !== "idle") — defensive
+  // Otherwise slow mode (SLOW_POLL_MS=5000ms), 12.5× cheaper.
+  //
+  // Wakeup paths back to fast:
+  //   - onMicTap → writeActiveTree(TREE_ID) → wakeRef.wake() → instant
+  //   - textDidChange / selectionDidChange listener fires → instant
+  //   - next slow poll re-evaluates → ≤5s self-recovery
   useEffect(() => {
-    log("mount · attached=", isKeyboardAttachedToInput())
+    log(
+      "mount · attached=",
+      isKeyboardAttachedToInput(),
+      "treeId=",
+      TREE_ID
+    )
     let cancelled = false
-    const refresh = () => {
+    let pollHandle: ReturnType<typeof setTimeout> | null = null
+    let inSlowMode = false
+
+    const poll = () => {
       if (cancelled) return
       setTick((v) => v + 1)
-      setTimeout(refresh, POLL_MS)
+      const stateNow = readState()
+      const activeTree = readActiveTree()
+      const shouldFast =
+        activeTree === null ||
+        activeTree === TREE_ID ||
+        stateNow !== "idle"
+      if (shouldFast && inSlowMode) {
+        log(
+          "poll resumed: fast (activeTree=",
+          activeTree,
+          "state=",
+          stateNow,
+          ")"
+        )
+        inSlowMode = false
+      } else if (!shouldFast && !inSlowMode) {
+        log(
+          "poll suspended: slow (mine=",
+          TREE_ID,
+          "active=",
+          activeTree,
+          ")"
+        )
+        inSlowMode = true
+      }
+      pollHandle = setTimeout(poll, shouldFast ? POLL_MS : SLOW_POLL_MS)
     }
-    refresh()
+
+    const wake = () => {
+      if (cancelled || !inSlowMode) return
+      if (pollHandle !== null) {
+        clearTimeout(pollHandle)
+        pollHandle = null
+      }
+      log("poll wakeup")
+      inSlowMode = false
+      poll()
+    }
+    wakeRef.wake = wake
+
+    CustomKeyboard.addListener("textDidChange", wake)
+    CustomKeyboard.addListener("selectionDidChange", wake)
+
+    poll()
+
     return () => {
       cancelled = true
+      if (pollHandle !== null) clearTimeout(pollHandle)
+      CustomKeyboard.removeListener("textDidChange", wake)
+      CustomKeyboard.removeListener("selectionDidChange", wake)
     }
   }, [])
 
@@ -276,6 +355,10 @@ function VoiceboardKeyboard() {
     // — only THIS tree's TREE_ID lands in vb:activeTree, and only this tree
     // will pass the consume filter when state reaches done.
     writeActiveTree(TREE_ID)
+    // L3: if THIS tree was in slow ghost mode (because activeTree pointed
+    // elsewhere before this tap), promote to fast immediately so the user
+    // sees state transitions without a 5s lag.
+    wakeRef.wake()
     CustomKeyboard.playInputClick()
     if (mode === "recording") {
       log("writeAction(stop)")
