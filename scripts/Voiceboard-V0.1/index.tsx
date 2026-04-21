@@ -49,6 +49,7 @@ import {
   readLog,
   readOpenAIKey,
   readPolishMs,
+  readPolishTimeoutSec,
   readRawText,
   readScribeKey,
   readSessionEndedAt,
@@ -67,6 +68,7 @@ import {
   writeHeartbeat,
   writeOpenAIKey,
   writePolishMs,
+  writePolishTimeoutSec,
   writeRawText,
   writeScribeKey,
   writeSessionEndedAt,
@@ -808,6 +810,12 @@ async function polishWithOpenAI(
 ): Promise<string> {
   log("openai POST · raw len=", rawText.length)
   const t0 = Date.now()
+  // Stage 5b — 读用户配置的超时（默认 20s，预设 10/20/30/60，可配 5-120s）。
+  // 超时后 fetch Promise reject，调用者（stopAndTranscribe 的 catch）会写
+  // error + errorKind="polish"，**不清 rawText**，键盘 done-consume 的
+  // finalText > rawText > error 优先级自然降级到未润色原文。
+  const timeoutSec = readPolishTimeoutSec()
+  log("openai timeout=", timeoutSec, "s")
   // Responses API 的 input 接受 plain string（隐式 user role），是最简形式。
   // reasoning.effort 在测试期保持 "none" 关掉思考，加快响应、节省 token。
   // 文档支持的 effort 值：none | minimal | low | medium | high | xhigh
@@ -825,6 +833,8 @@ async function polishWithOpenAI(
       reasoning: { effort: "none" },
       max_output_tokens: 1024,
     }),
+    timeout: timeoutSec,
+    debugLabel: "openai.polish",
   })
   const elapsedMs = Date.now() - t0
   log("openai response", res.status, `${elapsedMs}ms`)
@@ -1560,6 +1570,11 @@ function MainView() {
     if (prev !== null && prev > 0) return Math.round(prev / 60000)
     return 3
   })
+  // Stage 5b — polish timeout picker 当前选择（秒）。readPolishTimeoutSec
+  // 对脏数据 / 未设置过自动 fallback 到默认 20s，拿回来就是合法值。
+  const [polishTimeoutPick, setPolishTimeoutPick] = useState<number>(() =>
+    readPolishTimeoutSec()
+  )
 
   useEffect(() => {
     const q = Script.queryParameters ?? {}
@@ -1779,6 +1794,34 @@ function MainView() {
             <Text font="footnote" foregroundStyle="secondaryLabel">
               scribe {scribeKeySet ? "✓" : "✗"} · openai{" "}
               {openAIKeySet ? "✓" : "✗"}
+            </Text>
+          </VStack>
+
+          {/* Stage 5b — polish 超时预设选择。脚本默认 20s，用户可按网络
+               情况调大调小。点按钮即写 Storage + 刷新本地 state；下一次
+               polish fetch 会读到新值。 */}
+          <VStack spacing={4} alignment="leading">
+            <Text font="caption" foregroundStyle="secondaryLabel">
+              润色超时（polish timeout）· 当前 {polishTimeoutPick}s
+            </Text>
+            <HStack spacing={6}>
+              {[10, 20, 30, 60].map((sec) => (
+                <Button
+                  key={`polish-to-${sec}`}
+                  title={
+                    polishTimeoutPick === sec ? `✓ ${sec}s` : `${sec}s`
+                  }
+                  action={() => {
+                    writePolishTimeoutSec(sec)
+                    setPolishTimeoutPick(sec)
+                    setTick((t) => t + 1)
+                  }}
+                />
+              ))}
+              <Spacer />
+            </HStack>
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              网速慢 / 海外 / 蜂窝网络建议 30s+；超时后会降级插入未润色原文。
             </Text>
           </VStack>
 
