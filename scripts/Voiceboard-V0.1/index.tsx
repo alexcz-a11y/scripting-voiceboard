@@ -1083,6 +1083,9 @@ async function resetToIdle(): Promise<void> {
   clearSessionEndedAt()
   clearRawText()
   clearFinalText()
+  // Stage 5.1：err 和 errorKind 配对清掉。原代码只清了 errorKind 漏了 err，
+  // 依赖 MainView 按钮 action 里的 `clearError()` 补救；不健壮。
+  clearError()
   clearErrorKind()
   clearSttMs()
   clearPolishMs()

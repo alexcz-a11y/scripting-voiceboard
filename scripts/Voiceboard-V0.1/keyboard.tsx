@@ -10,6 +10,8 @@ import {
 } from "scripting"
 
 import {
+  clearError,
+  clearErrorKind,
   clearFilePath,
   clearFinalText,
   clearRawText,
@@ -309,12 +311,31 @@ function VoiceboardKeyboard() {
     clearFilePath()
     clearSessionStartedAt()
     clearSessionEndedAt()
-    // 注：err 不在这里清，留在主 app 错误区供用户查看；下次 startSession 会清
+    // Stage 5.1 修复：err / errKind 也必须在这里清掉。
+    //
+    // 老版注释写的是"留着给主 app 错误区查看，下次 startSession 会清" ——
+    // 但实测（2026-04-21 真机）暴露两个并发 bug：
+    //   a) 这个 effect 的 deps 含 finalText/rawText。上面 clearFinalText()
+    //      触发下一轮 render，effect 再次 fire。第一次走 finalText 分支
+    //      成功插入，clear 了 finalText/rawText，但 err 还在 storage 里
+    //      → 第二次 fire 时 finalText=null / rawText=null / err=stale →
+    //      落到 err 分支，把上一轮失败的错误占位再插一次。用户看到正常
+    //      文本后立刻又来一条"[转录失败: …]"，极诡异。
+    //   b) warm 模式下一次 cycle 失败后，err 永远留在 storage 里，
+    //      keyboard 的 statusLine `if (err !== null) return "错误 · ..."`
+    //      会持续显示第一次的错误文案，覆盖掉 "保持中 · 剩余 MM:SS"
+    //      和 "录音中 X.Xs"，直到用户手动去主 app 清。
+    // 既然 err 一旦被键盘渲染成占位符插入就已经"送达"了（等价于 finalText
+    // / rawText 的 delivered 语义），就在 consume 成功后一起清。没有用户
+    // 能看到但无处插入的遗留 err；handleCycleEnd 的 main-app 错误区显示
+    // 在 worker force-advance 路径下仍然保留（见 index.tsx）。
     //
     // Stage 4.5b —— 不再在这里 writeState("idle")！
     // 状态写入单一所有权：warm ↔ idle / warm ↔ armed 的转换由 index 的
     // worker 基于"rawText/finalText 已清空"的信号 + warmUntil 判断。
     // 键盘只负责把文本插到目标输入框，不动 state。
+    clearError()
+    clearErrorKind()
     log("done consumed · text inserted, cleared · state 留给 index 推进")
   }, [
     mode,
