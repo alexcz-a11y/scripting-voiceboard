@@ -284,20 +284,57 @@ async function throttledActivityUpdate(
 // 启动静音 keeper recorder。warm 窗口内它必须一直活着（audio 背景模式 +
 // Live Activity 的官方组合要求有 active audio I/O）。失败返回 false，
 // 由调用者决定是 abort 还是重试。
+//
+// 实测 bug（2026-04-21 真机日志）：在 handleCycleEnd 里"真实 recorder 停掉
+// → 起 keeper"这条路径，AudioRecorder.create 成功但 record() 返回 false。
+// 根因：real recorder 的 stop/dispose 把 iOS audio session 的"录音上下文"
+// 撕掉了，新 recorder 需要 setActive(true) 再走一次才能拿到新的录音上下文。
+// 修法：创建前显式 setActive(true) re-confirm（与 startRecorder 一致），
+// 并加一次 200ms 延迟 + 重试兜底应对 iOS session 状态切换的时序。
 async function startWarmSilentKeeper(): Promise<boolean> {
   if (warmSilentKeeper !== null) {
     log("startWarmSilentKeeper: already running, skipping")
     return true
   }
+  const path = await buildWarmKeeperPath()
+  log("warmSilentKeeper path=", path)
+
+  // 清掉上一轮的文件，避免 AudioRecorder 初始化时碰到残留 header。
+  // iOS 的 AVAudioRecorder 理论上会覆盖，但实测偶发对 overwrite 不友好；
+  // 一次 remove 更保险，FileManager.remove 不存在时自己吞异常。
   try {
-    const path = await buildWarmKeeperPath()
-    log("warmSilentKeeper path=", path)
-    const r = await AudioRecorder.create(path, {
-      format: "MPEG4AAC",
-      sampleRate: 22050,
-      numberOfChannels: 1,
-      encoderAudioQuality: AVAudioQuality.low,
-    })
+    await FileManager.remove(path)
+    log("warmSilentKeeper: removed stale file")
+  } catch {
+    // 文件不存在 / 删不掉都当 noop
+  }
+
+  // 内部 attempt 函数：setActive(true) + create + record；record() false 返 false。
+  const attempt = async (label: string): Promise<boolean> => {
+    try {
+      await SharedAudioSession.setActive(true)
+      log(`warmSilentKeeper[${label}]: setActive(true) re-confirmed`)
+    } catch (e) {
+      logErr(
+        `warmSilentKeeper[${label}]: setActive(true) threw:`,
+        String(e)
+      )
+    }
+    let r: AudioRecorder
+    try {
+      r = await AudioRecorder.create(path, {
+        format: "MPEG4AAC",
+        sampleRate: 22050,
+        numberOfChannels: 1,
+        encoderAudioQuality: AVAudioQuality.low,
+      })
+    } catch (e) {
+      logErr(
+        `warmSilentKeeper[${label}]: AudioRecorder.create threw:`,
+        String(e)
+      )
+      return false
+    }
     r.onError = (m: string) => {
       logErr("warmSilentKeeper.onError:", m)
     }
@@ -306,7 +343,7 @@ async function startWarmSilentKeeper(): Promise<boolean> {
     }
     const ok = r.record()
     log(
-      "warmSilentKeeper.record()=",
+      `warmSilentKeeper[${label}].record()=`,
       ok,
       "isRecording=",
       r.isRecording
@@ -319,10 +356,19 @@ async function startWarmSilentKeeper(): Promise<boolean> {
     }
     warmSilentKeeper = r
     return true
-  } catch (e) {
-    logErr("warmSilentKeeper create/record failed:", String(e))
-    return false
   }
+
+  // First try
+  if (await attempt("try1")) return true
+
+  // 失败：等一小段让 iOS session 状态稳定，然后重试一次。200ms 是经验值，
+  // 对应 AVAudioSession 的内部状态切换时间（实测 iOS 18/17 都够用）。
+  logErr("warmSilentKeeper: try1 failed, waiting 200ms then retry")
+  await new Promise<void>((res) => setTimeout(res, 200))
+  if (await attempt("try2")) return true
+
+  logErr("warmSilentKeeper: try2 also failed, giving up")
+  return false
 }
 
 async function stopWarmSilentKeeper(): Promise<void> {
