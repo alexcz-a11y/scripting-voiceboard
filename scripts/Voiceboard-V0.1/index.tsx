@@ -120,6 +120,10 @@ let doneStateSetAt = 0
 // handleCycleEnd 已经排期了吗？防止 worker tick 重复触发。
 let cycleEndInFlight = false
 
+// coldStartArmed 未读到用户偏好时的默认时长。3 min 与主页 duration picker
+// 默认档位一致；用户第一次从键盘激活、还没在主 app 配置过时就是这个值。
+const DEFAULT_WARM_DURATION_MS = 3 * 60 * 1000
+
 async function configureAudioSession(): Promise<void> {
   log("setCategory(playAndRecord, [defaultToSpeaker])")
   await SharedAudioSession.setCategory("playAndRecord", ["defaultToSpeaker"])
@@ -194,11 +198,20 @@ async function startRecorder(): Promise<boolean> {
   return true
 }
 
+// Legacy cold-start without warm 保持机制：仅用于 MainView 的"开启录音会话
+// （前台）" debug 按钮 + foregroundTestRecord。**用户走键盘 cold-start 的路径
+// 应改调 coldStartArmed（经 warm 全套 → armed），不走这条老路。**
 async function startSession(): Promise<void> {
   if (sessionActive) {
     log("startSession: already active")
     return
   }
+  // 归零 activeTree：新 session 起手，让所有键盘树从 activeTree=null 分支
+  // 起步（fast poll）。**必须在 await 前**，否则 iOS 在 configureAudioSession
+  // 的 ~300ms 里重建 keyboard VC，新树会读到还没被清掉的上一轮 T_tap.ID
+  // → L3 进 slow poll → 用户感觉"卡死"。（Stage 4 hygiene 修复在 v2 cold-start
+  // 路径的 recurrence 修复，见 memory/feedback_ghost_keyboard_l1_l2_l3.md）
+  clearActiveTree()
   try {
     await configureAudioSession()
     log("BackgroundKeeper.keepAlive()")
@@ -216,22 +229,15 @@ async function startSession(): Promise<void> {
       return
     }
     clearAction()
-    // 归零 activeTree：新 session 起手，让所有键盘树从 activeTree=null
-    // 分支起步（fast poll），等用户下次 tap 再写入新的 TREE_ID。避免
-    // 上一轮残留的 TREE_ID 让新可见树被错误地判成 ghost 而进 slow poll。
-    clearActiveTree()
     clearError()
     clearErrorKind()
     clearRawText()
     clearFinalText()
     clearSttMs()
     clearPolishMs()
-    // Stage 4.5b：如果是 iOS 杀掉旧 warm 实例后新实例走 cold-start，
-    // Storage 里可能残留前代的 warmUntil/warmDurationMs；清掉避免
-    // 后续 handleCycleEnd 根据这个判定"回 warm"但手上没 warmActivity /
-    // warmSilentKeeper 的尴尬。
+    // 旧 warm 实例的 warmUntil 清掉（避免 handleCycleEnd 误判"回 warm"）；
+    // **warmDurationMs 不清** —— 那是用户的持久化时长偏好，跨重启保留。
     clearWarmUntil()
-    clearWarmDurationMs()
     sessionActive = true
     workerCancelled = false
     writeState("armed")
@@ -419,6 +425,13 @@ async function startWarmSession(durationMs: number): Promise<boolean> {
   }
 
   // Fresh start。
+  //
+  // **在任何 await 之前先清 activeTree**。理由：走到这里的路径包括"键盘 tap
+  // 触发 cold-start"，tap 刚往 Storage 写了 activeTree=T_tap.ID。configureAudioSession
+  // 往下 ~300ms 里 iOS 可能重建 keyboard VC，新树读到 T_tap.ID（不是自己）
+  // + state 还是 idle → L3 判 slow poll → 用户感到"卡死"。早清 → 窗口归零。
+  // MainView useEffect mount 也做了一次，这里是二道保险（belt+suspenders）。
+  clearActiveTree()
   try {
     await configureAudioSession()
     await BackgroundKeeper.keepAlive()
@@ -463,9 +476,8 @@ async function startWarmSession(durationMs: number): Promise<boolean> {
       return false
     }
 
-    // 清 session 脏数据（与 startSession 语义一致）
+    // 清 session 脏数据（activeTree 已在函数顶清过，不重复）
     clearAction()
-    clearActiveTree()
     clearError()
     clearErrorKind()
     clearRawText()
@@ -539,7 +551,8 @@ async function stopWarmSession(reason: string): Promise<void> {
 
   await teardownAudioSession()
   clearWarmUntil()
-  clearWarmDurationMs()
+  // 注意：**不清 warmDurationMs**。持久化的用户偏好，跨 warm 结束要保留，
+  // 下次冷启动 / 打开主 app 时 duration picker 才能回填到用户上次选的档位。
   doneStateSetAt = 0
   cycleEndInFlight = false
   writeState("idle")
@@ -680,6 +693,46 @@ async function armFromWarm(): Promise<void> {
     elapsedSec: 0,
   })
   log("armFromWarm: OK · state=armed · keeper still running in parallel")
+}
+
+// --------------------------------------------------------------------------
+// coldStartArmed：从键盘冷启动（或"开启录音会话"按钮的未来升级路径）过来，
+// 把 warm 全套 + real recorder 一次性拉齐，state → armed。
+//
+// v2.4.5 Issue #1 的修复：之前键盘 idle tap → Safari.openURL(run_single,
+// action=arm) → MainView useEffect → startSession → 仅 armed（无 warm 保持）。
+// 录完一次 cycle 结束就 teardown，用户下一次要再走一遍冷启动。这不符合
+// Typeless 的"一次激活保持 N 分钟"心智。
+//
+// v2.4.5 起：键盘冷启动等价于在主 app 点"激活保持 X min"+ 立刻开始录。
+// X 从用户持久化的 warmDurationMs 读，没有就用 DEFAULT_WARM_DURATION_MS（3 min）。
+// cycle 结束后 handleCycleEnd 自然回 warm 等下次 tap，跟主 app 激活的体验一致。
+// --------------------------------------------------------------------------
+async function coldStartArmed(): Promise<void> {
+  if (sessionActive) {
+    log("coldStartArmed: sessionActive already true, skipping")
+    return
+  }
+  const pref = readWarmDurationMs()
+  const dur = pref !== null && pref > 0 ? pref : DEFAULT_WARM_DURATION_MS
+  log(
+    "coldStartArmed START · durationMs=",
+    dur,
+    pref === null ? "(default)" : "(user pref)"
+  )
+
+  const warmOk = await startWarmSession(dur)
+  if (!warmOk) {
+    logErr("coldStartArmed: startWarmSession failed, abort")
+    return
+  }
+
+  // state 现在是 warm，warmActivity + warmSilentKeeper 已经跑着。
+  // 直接进入 armed。armFromWarm 内部会检查 state==="warm" + sessionActive。
+  await armFromWarm()
+  // 到这里，如果 armFromWarm 成功 → state=armed；失败（startRecorder 返回
+  // false）→ state 回到 warm（用户可以从主 app 看到"保持中"，下次再点尝试）。
+  log("coldStartArmed END · state=", readState())
 }
 
 // Unified error finalizer. Every failure path in stopAndTranscribe funnels
@@ -991,7 +1044,8 @@ async function resetToIdle(): Promise<void> {
   clearPolishMs()
   // Stage 4.5b：warm 会话标记归零。
   clearWarmUntil()
-  clearWarmDurationMs()
+  // 注意：**不清 warmDurationMs**。"清除状态"重置的是 session 运行时状态，
+  // 不是用户配置。时长偏好持久化，用户下次激活时 duration picker 回显。
   writeState("idle")
 }
 
@@ -1477,6 +1531,19 @@ function MainView() {
     const q = Script.queryParameters ?? {}
     log("mount · queryParameters=", JSON.stringify(q))
 
+    // L1-style 卡死防御（Stage 4 的 hygiene 教训在 v2 cold-start 路径的 recurrence 修复）：
+    // 任何走到 MainView mount 的路径 —— 无论是用户从主 app 打开、键盘 tap
+    // 触发的 run_single cold-start、还是 run + onResume —— 都必然意味着
+    // "keyboard 侧可能刚写过的 activeTree=T_tap.ID 已经作废了"（tapping tree
+    // 马上或已经被 iOS 在 VC 切换时销毁）。**如果这个 T_tap.ID 滞留在 Storage
+    // 里，且新实例进入 armed/warm 的 ~300ms 里 iOS 又重建了 keyboard VC，
+    // 新树 T_new2 会读到 activeTree=T_tap.ID（不是自己）+ state 还来得及
+    // 更新成 idle → L3 shouldFast 判 false → 5s slow poll → 用户感知"卡死"**。
+    //
+    // 修法：mount 就无条件清 activeTree，把窗口从 ~300ms 缩到 0ms。
+    // startWarmSession / startSession 内部在 await 前也各自再清一次（belt+suspenders）。
+    clearActiveTree()
+
     // Stage 4.5b — 新实例启动时的陈旧 warm 状态清理。
     //
     // 场景：iOS 杀掉 warm 中的 Scripting（内存压力 / 用户上划）→ Storage
@@ -1490,10 +1557,8 @@ function MainView() {
     // 场面很乱。
     //
     // 策略：mount 时若 sessionActive=false（新实例）且 Storage 说 warm，
-    // 直接清掉 warm 残留 + state=idle。让用户重新激活。
-    // 注：这个清理对 queryParameters.action=arm 的 cold 路径也安全
-    // —— startSession 内部还有一次 clearWarmUntil/clearWarmDurationMs，
-    // 两处都清是 belt-and-suspenders。
+    // 直接清掉 warm 残留 + state=idle。让用户（或 coldStartArmed）重新激活。
+    // 注：coldStartArmed 读的是 warmDurationMs（用户持久化偏好），此处**不清**。
     if (!sessionActive) {
       const staleState = readState()
       const staleWarmUntil = readWarmUntil()
@@ -1505,9 +1570,11 @@ function MainView() {
           staleWarmUntil
         )
         clearAction()
-        clearActiveTree()
+        // activeTree 上面已经清了，这里不重复
         clearWarmUntil()
-        clearWarmDurationMs()
+        // 注意：**不清 warmDurationMs**。用户在主 app 配置的时长是持久化偏好，
+        // 跨重启 / 清理 / run_single 重建实例都要保留。duration picker 的
+        // useState 初值会读它回填，coldStartArmed 也会读它作为激活时长。
         // rawText/finalText 若还有待消费的内容先留着 —— 如果此时键盘
         // 其实还在目标 app 里准备 consume done，别把 payload 剪了。
         // startSession 路径会在 arm 时清，这里不动。
@@ -1518,8 +1585,15 @@ function MainView() {
     }
 
     if (q.action === "arm") {
-      log("auto-arm from URL scheme")
-      startSession()
+      // v2.4.5 Issue #1 修复：URL scheme cold-start 不再走老 startSession
+      // （只到 armed、无保持），改走 coldStartArmed —— startWarmSession 先
+      // 把 warm 全套拉起来（keeper + LA + warmUntil + keepAlive）再
+      // armFromWarm 直接进入 armed。录完一次 cycle 后 handleCycleEnd 会
+      // 自然回到 warm，等用户下一次 tap。
+      // 这样"从键盘激活"和"从主 app 点激活保持"就等价了，用户的 warmDurationMs
+      // 偏好在两条路径里一致生效。
+      log("auto-arm from URL scheme → coldStartArmed")
+      coldStartArmed()
     }
     let cancelled = false
     const refresh = () => {
