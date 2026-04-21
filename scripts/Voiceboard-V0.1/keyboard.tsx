@@ -410,19 +410,24 @@ function VoiceboardKeyboard() {
     }
 
     // ------------------------------------------------------------------
-    // Stage 4.5b — warm fast-path（选项甲）
+    // Stage 4.5b v2 — warm fast-path（选项乙 + 过期回退）
     //
-    // warm 态：保持态活着，不走 cold start。策略：
-    //   1. writeAction("arm") 让 index worker 下一个 tick 起 real recorder
-    //   2. Safari.openURL("scripting://run/...") —— 用 `run` 而非
-    //      `run_single`，保住已存活的 index 实例 + 所有 warm 模块状态
-    //      （audio session / silent keeper / Live Activity / warmUntil）。
-    //      触发的是 `Script.onResume`，不重跑入口文件。
-    //   3. 用户会看到 ~0.3s iOS 系统级 app 切换动画，这和 Typeless 的
-    //      实际表现一致，无法抑制；但 warm 状态全保住，连续录音不卡。
+    // warm 态 + heartbeat 新鲜 = index worker 确定在后台转 → 纯 Storage 信号
+    // 触发，**不跳转 Scripting**。用户留在当前 app，录音直接开始（和 Typeless
+    // 完全一致，无切屏动画）。
     //
-    // 防御：warmUntil 若在这一瞬过期（边缘时序），退回 idle 路径 cold
-    // start 走；不会出现"key 点了但 worker 没响应"的卡死。
+    // 4.5b v1 曾经在这里无条件 openURL("scripting://run/...") 触发 onResume
+    // 唤醒。真机实测日志（2026-04-21 01:26）证明 worker 在 onResume 触发前
+    // 就已经处理了 action —— 说明 worker 本来就在背景跑，openURL 的唯一效果
+    // 是把 Scripting 切到前台，用户体验成"每次录音都跳一下"。
+    //
+    // v2 策略（对应用户要求"跳转应该取决于状态和条件"）：
+    //   1. mode=warm + warmUntil 未过期 + heartbeat 新鲜 → 仅 writeAction("arm")
+    //      worker 在 ≤400ms 内读取到并 armFromWarm；完全无切屏。
+    //   2. mode=warm + warmUntil 未过期 + heartbeat 过期 (>2s) → 说明 worker
+    //      真的被挂起了 → 写 action + openURL 唤醒。这种情况在 v2 的"keeper
+    //      全程跑"架构下理论上不应该发生，但保留为安全网。
+    //   3. mode=warm + warmUntil 过期 → fall through idle 冷启动路径。
     // ------------------------------------------------------------------
     if (mode === "warm") {
       const wu = readWarmUntil()
@@ -430,18 +435,46 @@ function VoiceboardKeyboard() {
         log("onMicTap · warm but warmUntil expired → cold path")
         // fall through to idle branch below
       } else {
+        // 刷新读一次 heartbeat（render 时的闭包可能已经过时几十 ms）
+        const hb = readHeartbeat()
+        const hbAgeMs = hb !== null ? Date.now() - hb : Infinity
+        const workerAlive = hbAgeMs < 2000
+
+        writeAction("arm")
+
+        if (workerAlive) {
+          // 主路径：纯 Storage 信号，无切屏。worker 会在 ≤400ms 内处理。
+          log(
+            "warm fast-path · writeAction(arm) · NO openURL",
+            "(worker alive, heartbeat",
+            hbAgeMs,
+            "ms old)"
+          )
+          setOpenURLResult(
+            `warm action=arm 已写 · heartbeat ${hbAgeMs}ms · 不跳转`
+          )
+          return
+        }
+
+        // 兜底：heartbeat 过期 → worker 可能被 iOS 挂起 → openURL 唤醒
         const url = Script.createRunURLScheme(Script.name, {
           action: "arm",
         })
-        log("warm fast-path · writeAction(arm) · Safari.openURL ->", url)
-        writeAction("arm")
+        logErr(
+          "warm fast-path · heartbeat stale (",
+          hbAgeMs,
+          "ms) · fallback openURL ->",
+          url
+        )
         try {
           const ok = await Safari.openURL(url)
-          log("Safari.openURL(run) returned", ok)
-          setOpenURLResult(`warm run openURL returned ${String(ok)}`)
+          log("Safari.openURL(run) fallback returned", ok)
+          setOpenURLResult(
+            `warm fallback openURL (heartbeat ${hbAgeMs}ms stale) returned ${String(ok)}`
+          )
         } catch (e) {
           logErr("Safari.openURL(run) threw:", String(e))
-          setOpenURLResult(`warm run openURL threw ${String(e)}`)
+          setOpenURLResult(`warm fallback openURL threw ${String(e)}`)
         }
         return
       }
