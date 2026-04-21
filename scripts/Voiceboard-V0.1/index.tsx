@@ -17,6 +17,7 @@ import {
   buildRecordingPath,
   clearAction,
   clearError,
+  clearFinalText,
   clearLog,
   clearOpenAIKey,
   clearRawText,
@@ -28,6 +29,7 @@ import {
   readAction,
   readError,
   readFilePath,
+  readFinalText,
   readHeartbeat,
   readLog,
   readOpenAIKey,
@@ -40,6 +42,7 @@ import {
   vblogErr,
   writeError,
   writeFilePath,
+  writeFinalText,
   writeHeartbeat,
   writeOpenAIKey,
   writeRawText,
@@ -156,6 +159,7 @@ async function startSession(): Promise<void> {
     clearAction()
     clearError()
     clearRawText()
+    clearFinalText()
     sessionActive = true
     workerCancelled = false
     writeState("armed")
@@ -183,6 +187,89 @@ async function teardownAudioSession(): Promise<void> {
   }
   sessionActive = false
   workerCancelled = true
+}
+
+const POLISH_INSTRUCTIONS = `你是一个语音输入润色助手。把用户口述的中文文本整理成自然流畅的书面或口语表达：
+- 修正口误、错别字、识别错误。
+- 加合适的标点。
+- 保留用户原意，不要扩写、不要总结、不要回答问题、不要加任何解释。
+- 直接输出润色后的文本，不要前缀，不要引号。`
+
+// Defensive parser: Responses API has a few possible shapes depending on
+// model + tool usage. Try the documented `output_text` shortcut first, then
+// walk the structured `output[]` tree, then bail with a useful error.
+function extractResponsesText(json: unknown): string {
+  const j = json as {
+    output_text?: string
+    output?: Array<{
+      type?: string
+      text?: string
+      content?: Array<{ type?: string; text?: string }>
+    }>
+  }
+  if (typeof j.output_text === "string" && j.output_text.length > 0) {
+    return j.output_text
+  }
+  if (Array.isArray(j.output)) {
+    const parts: string[] = []
+    for (const item of j.output) {
+      if (typeof item.text === "string" && item.text.length > 0) {
+        parts.push(item.text)
+        continue
+      }
+      if (Array.isArray(item.content)) {
+        for (const c of item.content) {
+          if (typeof c.text === "string" && c.text.length > 0) {
+            parts.push(c.text)
+          }
+        }
+      }
+    }
+    if (parts.length > 0) return parts.join("")
+  }
+  throw new Error(
+    `cannot extract text from response: ${JSON.stringify(json).slice(0, 300)}`
+  )
+}
+
+async function polishWithOpenAI(
+  rawText: string,
+  key: string
+): Promise<string> {
+  log("openai POST · raw len=", rawText.length)
+  const t0 = Date.now()
+  // Responses API 的 input 接受 plain string（隐式 user role），是最简形式。
+  // reasoning.effort 在测试期保持 "none" 关掉思考，加快响应、节省 token。
+  // 文档支持的 effort 值：none | minimal | low | medium | high | xhigh
+  // 仅对 gpt-5 / o 系列 reasoning 模型生效。
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-5.4-mini",
+      input: rawText,
+      instructions: POLISH_INSTRUCTIONS,
+      reasoning: { effort: "none" },
+      max_output_tokens: 1024,
+    }),
+  })
+  const elapsedMs = Date.now() - t0
+  log("openai response", res.status, `${elapsedMs}ms`)
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "<no body>")
+    throw new Error(
+      `openai ${res.status}: ${errBody.slice(0, 200)}`
+    )
+  }
+  const json = await res.json()
+  // 第一次接入务必打全响应（Responses API 的 output[] 嵌套结构变种较多）
+  log("openai raw json:", JSON.stringify(json).slice(0, 800))
+  const text = extractResponsesText(json)
+  log("openai polished len=", text.length, "preview=", text.slice(0, 60))
+  return text
 }
 
 async function transcribeWithScribe(
@@ -260,15 +347,39 @@ async function stopAndTranscribe(): Promise<void> {
     return
   }
 
+  let rawText: string
   try {
-    const text = await transcribeWithScribe(path, key)
-    writeRawText(text)
-    writeState("done")
-    log("STT ok · state=done · keyboard will consume rawText")
+    rawText = await transcribeWithScribe(path, key)
+    writeRawText(rawText)
   } catch (e) {
     const msg = String((e as Error)?.message ?? e)
     logErr("transcribe failed:", msg)
     writeError(`STT: ${msg}`)
+    writeState("done")
+    await teardownAudioSession()
+    return
+  }
+
+  // 3. polish phase (optional — skipped if no OpenAI key)
+  const openaiKey = readOpenAIKey()
+  if (openaiKey === null || openaiKey.length === 0) {
+    log("no OpenAI key · skipping polish · state=done with rawText")
+    writeState("done")
+    await teardownAudioSession()
+    return
+  }
+  writeState("polishing")
+  log("state=polishing")
+  try {
+    const polished = await polishWithOpenAI(rawText, openaiKey)
+    writeFinalText(polished)
+    writeState("done")
+    log("polish ok · state=done · keyboard will consume finalText")
+  } catch (e) {
+    const msg = String((e as Error)?.message ?? e)
+    logErr("polish failed:", msg)
+    writeError(`polish: ${msg}`)
+    // 注意：rawText 留在 storage，键盘 fallback 到 rawText
     writeState("done")
   }
   await teardownAudioSession()
@@ -297,6 +408,7 @@ async function resetToIdle(): Promise<void> {
   clearSessionStartedAt()
   clearSessionEndedAt()
   clearRawText()
+  clearFinalText()
   writeState("idle")
 }
 
@@ -384,6 +496,7 @@ function MainView() {
   const err = readError()
   const heartbeat = readHeartbeat()
   const rawText = readRawText()
+  const finalText = readFinalText()
   const q = Script.queryParameters ?? {}
   const qpStr = JSON.stringify(q)
   const logEntries = readLog()
@@ -548,6 +661,15 @@ function MainView() {
                 Scribe 转录（rawText）
               </Text>
               <Text font="footnote">{rawText}</Text>
+            </VStack>
+          ) : null}
+
+          {finalText !== null ? (
+            <VStack spacing={4} alignment="leading">
+              <Text font="caption" foregroundStyle="secondaryLabel">
+                OpenAI 润色（finalText）
+              </Text>
+              <Text font="footnote">{finalText}</Text>
             </VStack>
           ) : null}
 

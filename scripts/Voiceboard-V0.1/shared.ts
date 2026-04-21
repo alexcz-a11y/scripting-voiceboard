@@ -12,6 +12,7 @@ export const K_SCRIBE_KEY = "vb:scribeKey"
 export const K_OPENAI_KEY = "vb:openAIKey"
 export const K_RAW_TEXT = "vb:rawText"
 export const K_FINAL_TEXT = "vb:finalText"
+export const K_ACTIVE_TREE = "vb:activeTree"
 
 export const RECORDINGS_SUBDIR = "Voiceboard"
 
@@ -147,6 +148,22 @@ export function writeFinalText(t: string): void {
 
 export function clearFinalText(): void {
   Storage.remove(K_FINAL_TEXT, opts)
+}
+
+// Active-tree filter: each keyboard React tree gets a unique id at module
+// load. The user's tap on the mic button writes that id here. The done
+// consumer only fires for the matching tree, so ghost React trees (from
+// hot-reload or iOS view-controller reuse) cannot win the consume race.
+export function readActiveTree(): string | null {
+  return Storage.get<string>(K_ACTIVE_TREE, opts) ?? null
+}
+
+export function writeActiveTree(id: string): void {
+  Storage.set(K_ACTIVE_TREE, id, opts)
+}
+
+export function clearActiveTree(): void {
+  Storage.remove(K_ACTIVE_TREE, opts)
 }
 
 export async function ensureRecordingsDir(): Promise<string> {
