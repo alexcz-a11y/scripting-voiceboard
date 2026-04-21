@@ -124,6 +124,12 @@ let cycleEndInFlight = false
 // 默认档位一致；用户第一次从键盘激活、还没在主 app 配置过时就是这个值。
 const DEFAULT_WARM_DURATION_MS = 3 * 60 * 1000
 
+// Stage 5a — 调试回放用的 AVPlayer 单例。MainView "录音文件" section 的
+// ▶/⏸ 按钮使用，让用户能听刚录的 m4a，排查"转录不对"到底是录音坏了还是
+// STT/polish 理解错。纯调试工具：不接 warm/armed session 的任何生命周期，
+// 不 dispose（Scripting 关 script 时会自动回收）。
+let debugPlayer: AVPlayer | null = null
+
 async function configureAudioSession(): Promise<void> {
   log("setCategory(playAndRecord, [defaultToSpeaker])")
   await SharedAudioSession.setCategory("playAndRecord", ["defaultToSpeaker"])
@@ -835,6 +841,34 @@ async function polishWithOpenAI(
   log("openai polished len=", text.length, "preview=", text.slice(0, 60))
   writePolishMs(elapsedMs)
   return text
+}
+
+// Stage 5a — 调试回放。点 ▶ 从头播放当前 filePath 指向的 m4a。
+//
+// 设计选择：每次点 ▶ 都调 `stop()` 重置到开头（而非从暂停处继续）。用户
+// 心智：▶ = 重新播一遍。这样在 ⏸ 之后再点 ▶ 行为稳定，不会出现"上次播
+// 到哪里了"的歧义。如果未来要"从暂停处继续"可以加独立 `▶▶ 继续` 按钮。
+//
+// Singleton：`debugPlayer` 在模块级 `let`。首次调用时 lazy 创建 + 绑 onError
+// / onEnded 两个 log 回调；之后的调用复用同一实例，只换 source。不 dispose。
+function debugPlayback(path: string): void {
+  if (debugPlayer === null) {
+    debugPlayer = new AVPlayer()
+    debugPlayer.onError = (m) => logErr("debug player:", m)
+    debugPlayer.onEnded = () => log("debug player ended")
+  }
+  debugPlayer.stop()
+  const ok = debugPlayer.setSource(path)
+  if (!ok) {
+    logErr("debug player setSource failed:", path)
+    return
+  }
+  const played = debugPlayer.play()
+  if (!played) logErr("debug player play() returned false")
+}
+
+function debugPlaybackPause(): void {
+  if (debugPlayer !== null) debugPlayer.pause()
 }
 
 async function transcribeWithScribe(
@@ -1857,6 +1891,18 @@ function MainView() {
                 录音文件
               </Text>
               <Text font="footnote">{filePath}</Text>
+              {/* Stage 5a — 调试回放。filePath.length===0 是 startWarmSession
+                   置空的情况（warm 还没录过），按钮隐藏避免空播。 */}
+              {filePath.length > 0 ? (
+                <HStack spacing={8}>
+                  <Button
+                    title="▶ 播放"
+                    action={() => debugPlayback(filePath)}
+                  />
+                  <Button title="⏸ 暂停" action={debugPlaybackPause} />
+                  <Spacer />
+                </HStack>
+              ) : null}
               {sessionStartedAt !== null ? (
                 <Text font="footnote" foregroundStyle="secondaryLabel">
                   started at {sessionStartedAt}
