@@ -282,15 +282,16 @@ async function throttledActivityUpdate(
 }
 
 // 启动静音 keeper recorder。warm 窗口内它必须一直活着（audio 背景模式 +
-// Live Activity 的官方组合要求有 active audio I/O）。失败返回 false，
-// 由调用者决定是 abort 还是重试。
+// Live Activity 的官方组合要求有 active audio I/O）。
 //
-// 实测 bug（2026-04-21 真机日志）：在 handleCycleEnd 里"真实 recorder 停掉
-// → 起 keeper"这条路径，AudioRecorder.create 成功但 record() 返回 false。
-// 根因：real recorder 的 stop/dispose 把 iOS audio session 的"录音上下文"
-// 撕掉了，新 recorder 需要 setActive(true) 再走一次才能拿到新的录音上下文。
-// 修法：创建前显式 setActive(true) re-confirm（与 startRecorder 一致），
-// 并加一次 200ms 延迟 + 重试兜底应对 iOS session 状态切换的时序。
+// **v2 架构下只在 `startWarmSession` 里调一次**（整个 warm 窗口唯一一次）。
+// handleCycleEnd 和 armFromWarm 不再调这个函数 —— v1 曾经在 handleCycleEnd
+// 里"重启 keeper"，实测 100% 失败（详见 memory/feedback_keyboard_warm_trigger_option_a.md
+// 的"v1 架构错误教训"）。v2 承认"stop 过的 recording 上下文无法重建"，
+// 改成 keeper 全程不停 + real recorder 与之并行。
+//
+// 下面的 setActive re-confirm + 文件清理 + 200ms retry 是从 v1 继承的防御措施；
+// 在 v2 的单次调用场景里 retry 基本不会触发，但保留无害。
 async function startWarmSilentKeeper(): Promise<boolean> {
   if (warmSilentKeeper !== null) {
     log("startWarmSilentKeeper: already running, skipping")
@@ -550,6 +551,13 @@ async function stopWarmSession(reason: string): Promise<void> {
 //
 // 被 workerTick 的 "done 且 keyboard 已消费" 分支调用；保证对每次 done
 // 只跑一次（cycleEndInFlight 互斥）。
+// v2（keeper 并行不停架构）：一次录音 cycle 结束后的分流。
+//
+// v1 在这里 restart keeper（失败），v2 完全不碰 keeper —— 整个 warm 窗口
+// 里 keeper 只在 startWarmSession 启动一次、stopWarmSession 停止一次。
+// 这里只做两件事：
+//   a) 软错误（stt/polish）或正常完成 + warm 未过期 → writeState("warm") + LA update
+//   b) 硬错误（record/setup）或 warm 已过期 → stopWarmSession 全量收尾
 async function handleCycleEnd(): Promise<void> {
   if (cycleEndInFlight) {
     log("handleCycleEnd: already in flight, skipping")
@@ -572,7 +580,9 @@ async function handleCycleEnd(): Promise<void> {
       "warmActive=",
       warmActive,
       "isHardError=",
-      isHardError
+      isHardError,
+      "keeper.isRecording=",
+      warmSilentKeeper?.isRecording ?? "null"
     )
 
     if (isHardError || !warmActive) {
@@ -582,16 +592,10 @@ async function handleCycleEnd(): Promise<void> {
       return
     }
 
-    // 回到 warm。
-    const keeperOk = await startWarmSilentKeeper()
-    if (!keeperOk) {
-      logErr("handleCycleEnd: silent keeper restart failed")
-      writeError("保持静音 keeper 重启失败")
-      writeErrorKind("record")
-      await stopWarmSession("keeper restart failed")
-      return
-    }
-
+    // v2：keeper 从未 stop，直接保持 warm。不碰 warmSilentKeeper。
+    // 健全性：如果 keeper 真的意外死了，这就是架构不变式违反，
+    // 上层的 workerTick watchdog 会在下一 tick 检测到并 abort。
+    // 这里不做恢复尝试 —— 见 memory/feedback_keyboard_warm_trigger_option_a.md。
     clearSessionStartedAt()
     clearSessionEndedAt()
     clearRawText()
@@ -606,7 +610,8 @@ async function handleCycleEnd(): Promise<void> {
     })
     log(
       "handleCycleEnd: back to warm · remainingSec=",
-      remainingSec
+      remainingSec,
+      "· keeper unchanged"
     )
   } finally {
     cycleEndInFlight = false
@@ -615,8 +620,21 @@ async function handleCycleEnd(): Promise<void> {
 
 // 处理 keyboard 的 "arm" action：warm → armed 的转换。停静音 keeper、
 // 起 real recorder、写 state=armed、LA 切 armed。
+// v2（keeper 并行不停架构）：处理 keyboard 的 "arm" action，warm → armed 转换。
+//
+// 关键差异 vs v1：
+//   v1 先 stop warmSilentKeeper 再 startRecorder（real）—— 这一步 stop 撕掉
+//   iOS AVAudioSession 的 recording 上下文，下一轮 handleCycleEnd 重启 keeper
+//   时会失败（详见 memory/feedback_keyboard_warm_trigger_option_a.md "v1 架构
+//   错误教训"）。
+//   v2 **不动 keeper**，让它继续录 warm_keeper.m4a。直接起 real recorder，
+//   两个 recorder 并行录音到各自文件。iOS 录音上下文始终有活的 recorder 撑
+//   着 → 永不撕掉 → 后续所有 create + record 都能成功。
+//
+// 依据：dts/global.d.ts:5005-5017 的 recorderOne/Two.record({atTime}) 官方
+// 示例就是两 recorder 并行。
 async function armFromWarm(): Promise<void> {
-  log("armFromWarm START")
+  log("armFromWarm START (v2: parallel keeper)")
   if (!sessionActive) {
     logErr("armFromWarm: sessionActive=false, abort")
     return
@@ -627,24 +645,31 @@ async function armFromWarm(): Promise<void> {
     return
   }
 
-  // 关静音 keeper，给 real recorder 让路。audio session 保持 active。
-  await stopWarmSilentKeeper()
+  // v2：不 stopWarmSilentKeeper！keeper 继续录，与 real recorder 并行。
+  // 这是整个架构的核心不变式（见 memory 教训）。
+  if (warmSilentKeeper === null || !warmSilentKeeper.isRecording) {
+    // 这本来不该发生（keeper 应全程活着）。但真遇到就 abort warm，
+    // 不要在这里尝试 restart（那正是 v1 栽跟头的地方）。
+    logErr(
+      "armFromWarm: BUG · warmSilentKeeper not alive when arm requested;",
+      "keeper=",
+      warmSilentKeeper === null ? "null" : "exists",
+      "isRecording=",
+      warmSilentKeeper?.isRecording
+    )
+    writeError("keeper 意外停止（iOS 可能回收了输入）")
+    writeErrorKind("record")
+    await stopWarmSession("armFromWarm keeper invariant violated")
+    return
+  }
 
-  // 起 real recorder（复用现有 startRecorder）。
+  // 起 real recorder（复用现有 startRecorder）。keeper 同时在录。
   const ok = await startRecorder()
   if (!ok) {
-    logErr("armFromWarm: startRecorder failed; rolling back to warm")
-    // 回滚：尝试重启静音 keeper 让 warm 继续
-    const keeperOk = await startWarmSilentKeeper()
-    if (!keeperOk) {
-      logErr(
-        "armFromWarm: failed + keeper restart failed → stopWarmSession"
-      )
-      await stopWarmSession("armFromWarm keeper restart failed")
-      return
-    }
-    // real recorder 起不来（可能 mic 被其他 app 抢占？），保持 warm 让用户重试
+    // real 起不来（mic 被其他 app 抢占？）。keeper 本来就没停，
+    // 不需要回滚 —— 直接保持 warm 让用户重试。
     // 注：startRecorder 内部已经 writeError + writeErrorKind("record")
+    logErr("armFromWarm: startRecorder failed; staying in warm")
     writeState("warm")
     return
   }
@@ -654,7 +679,7 @@ async function armFromWarm(): Promise<void> {
     status: "armed",
     elapsedSec: 0,
   })
-  log("armFromWarm: OK · state=armed")
+  log("armFromWarm: OK · state=armed · keeper still running in parallel")
 }
 
 // Unified error finalizer. Every failure path in stopAndTranscribe funnels
@@ -1014,7 +1039,7 @@ async function workerTick(): Promise<void> {
 
   // ---- 2. Periodic state maintenance ------------------------------------
   // 2a. warm：warmUntil 过期 → stopWarmSession；否则刷新 LA remainingSec；
-  //           watchdog silent keeper。
+  //           v2 watchdog：keeper 不变式违反 → 直接 abort（不尝试恢复）。
   if (state === "warm") {
     const warmUntil = readWarmUntil()
     const now = Date.now()
@@ -1023,19 +1048,22 @@ async function workerTick(): Promise<void> {
       await stopWarmSession("warmUntil expired")
       return
     }
-    // Silent keeper watchdog：warm 窗口内必须有 active keeper（audio 保活条件）。
+    // v2 watchdog：warm 窗口里 keeper 必须一直在录。如果这个不变式被违反
+    // （iOS 杀了 keeper / 硬件回收 / 内存压力），不要尝试 restart —— v1 已经
+    // 证明"stop 过的 session recording 重启几乎必然失败"。直接 abort + teardown。
+    // 这是 v2 与 v1 最核心的分歧：承认失败而不是假装能恢复。
     if (warmSilentKeeper === null || !warmSilentKeeper.isRecording) {
       logErr(
-        "worker · warm · silent keeper missing or not recording, restarting"
+        "worker · warm · keeper invariant violated (keeper=",
+        warmSilentKeeper === null ? "null" : "exists",
+        "isRecording=",
+        warmSilentKeeper?.isRecording,
+        "); aborting warm"
       )
-      const ok = await startWarmSilentKeeper()
-      if (!ok) {
-        logErr("worker · warm · keeper restart failed, aborting warm")
-        writeError("warm keeper 中断且恢复失败")
-        writeErrorKind("record")
-        await stopWarmSession("keeper watchdog failed")
-        return
-      }
+      writeError("保持静音 keeper 意外中断")
+      writeErrorKind("record")
+      await stopWarmSession("keeper watchdog invariant violation")
+      return
     }
     // LA 刷新 remainingSec（节流 1s）
     if (warmUntil !== null) {
