@@ -20,6 +20,13 @@ export const K_POLISH_MS = "vb:polishMs"
 // 代表非 warm。warmDurationMs 是用户上一次选的时长，用于激活面板回显。
 export const K_WARM_UNTIL = "vb:warmUntil"
 export const K_WARM_DURATION_MS = "vb:warmDurationMs"
+// Stage 5b — OpenAI polish fetch timeout（秒）。用户可在主 app 调；默认 20s
+// 是对"正常 3.9–4.8s" × ~4-5x 缓冲的保守选择。网速慢时调大，急调试时调小。
+// 跟 warmDurationMs 一样是用户偏好，teardown / resetToIdle 都不清。
+export const K_POLISH_TIMEOUT_SEC = "vb:polishTimeoutSec"
+export const DEFAULT_POLISH_TIMEOUT_SEC = 20
+export const MIN_POLISH_TIMEOUT_SEC = 5
+export const MAX_POLISH_TIMEOUT_SEC = 120
 
 export const RECORDINGS_SUBDIR = "Voiceboard"
 // Stage 4.5b — 静音 keeper 录音文件名。warm 窗口内持续录到这里（覆盖写），
@@ -193,6 +200,32 @@ export function writeWarmDurationMs(ms: number): void {
 
 export function clearWarmDurationMs(): void {
   Storage.remove(K_WARM_DURATION_MS, opts)
+}
+
+// Stage 5b — OpenAI polish 的 fetch 超时（秒），用户可配置。
+// 读：脏数据（undefined / NaN / 负数 / 超范围）一律 fallback 到默认 20s。
+// 写：clamp 到 [MIN, MAX]。之所以 clamp 而不是 throw —— Storage 跨进程，
+// 脏数据更可能是静默写入，我们宁可 clamp 成合法值也不让 polish 链路炸掉。
+export function readPolishTimeoutSec(): number {
+  const v = Storage.get<number>(K_POLISH_TIMEOUT_SEC, opts)
+  if (
+    typeof v !== "number" ||
+    !isFinite(v) ||
+    v < MIN_POLISH_TIMEOUT_SEC ||
+    v > MAX_POLISH_TIMEOUT_SEC
+  ) {
+    return DEFAULT_POLISH_TIMEOUT_SEC
+  }
+  return v
+}
+
+export function writePolishTimeoutSec(sec: number): void {
+  const rounded = Math.round(sec)
+  const clamped = Math.max(
+    MIN_POLISH_TIMEOUT_SEC,
+    Math.min(MAX_POLISH_TIMEOUT_SEC, rounded)
+  )
+  Storage.set(K_POLISH_TIMEOUT_SEC, clamped, opts)
 }
 
 export function readScribeKey(): string | null {
