@@ -1,0 +1,39 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors / IDEs
+.idea/
+*.swp
+*.swo
+*~
+
+# Node / npm (in case they get added later)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp.*
+
+# Scripting CLI auto-generated TypeScript defs.
+# `npx scripting-cli start` regenerates dts/ on every connect to the iOS
+# Scripting app — they're derived artifacts, not source.
+dts/
+
+# Local reference docs (Scripting llms-full). Too large to ship in repo.
+reference/
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+*.local
+secrets.json
+*.key
+
+# Build / tmp
+dist/
+build/
+tmp/
+*.log

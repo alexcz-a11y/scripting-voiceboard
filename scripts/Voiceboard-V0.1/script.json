@@ -1,0 +1,40 @@
+{
+  "intentInputTypes" : [
+
+  ],
+  "localizedDescriptions" : {
+    "fr" : "",
+    "en" : "",
+    "es" : "",
+    "ja" : "",
+    "pt" : "",
+    "ru" : "",
+    "zh" : "",
+    "de" : "",
+    "it" : ""
+  },
+  "color" : "rgba(230, 190, 1,1)",
+  "author" : null,
+  "description" : null,
+  "contributors" : [
+
+  ],
+  "entry" : "index.tsx",
+  "runInApp" : false,
+  "icon" : "square.2.layers.3d.fill",
+  "localizedNames" : {
+    "fr" : "",
+    "en" : "",
+    "es" : "",
+    "ja" : "",
+    "pt" : "",
+    "ru" : "",
+    "zh" : "",
+    "de" : "",
+    "it" : ""
+  },
+  "version" : "1.0.0",
+  "iconImage" : null,
+  "remoteResource" : null,
+  "name" : "Voiceboard-V0.1"
+}
