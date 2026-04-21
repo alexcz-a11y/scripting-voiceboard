@@ -17,6 +17,7 @@ import {
   clearSessionStartedAt,
   readActiveTree,
   readError,
+  readErrorKind,
   readFilePath,
   readFinalText,
   readHeartbeat,
@@ -24,6 +25,7 @@ import {
   readSessionEndedAt,
   readSessionStartedAt,
   readState,
+  VBErrorKind,
   VBState,
   vblog,
   vblogErr,
@@ -176,6 +178,7 @@ function VoiceboardKeyboard() {
   const sessionEndedAt = readSessionEndedAt()
   const filePath = readFilePath()
   const err = readError()
+  const errKind = readErrorKind()
   const heartbeat = readHeartbeat()
   const rawText = readRawText()
   const finalText = readFinalText()
@@ -236,10 +239,17 @@ function VoiceboardKeyboard() {
       payload = rawText
       payloadKind = "rawText"
     } else if (err !== null && err.length > 0) {
-      payload = err.startsWith("polish:")
-        ? `[润色失败: ${err}]`
-        : `[转录失败: ${err}]`
-      payloadKind = "errorPlaceholder"
+      // errKind (Stage 4+) 决定占位符前缀；旧会话没写 kind 时 fallback 到
+      // "转录失败"（最常见的失败路径）。
+      const labelByKind: Record<VBErrorKind, string> = {
+        setup: "准备失败",
+        record: "录音失败",
+        stt: "转录失败",
+        polish: "润色失败",
+      }
+      const label = errKind !== null ? labelByKind[errKind] : "转录失败"
+      payload = `[${label}: ${err}]`
+      payloadKind = `errorPlaceholder(${errKind ?? "?"})`
     } else if (filePath !== null && sessionStartedAt !== null) {
       const dur =
         sessionEndedAt !== null
@@ -289,6 +299,7 @@ function VoiceboardKeyboard() {
     rawText,
     finalText,
     err,
+    errKind,
   ])
 
   const coldStartTimedOut =

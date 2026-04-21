@@ -16,39 +16,50 @@ import {
 import {
   buildRecordingPath,
   clearAction,
+  clearActiveTree,
   clearError,
+  clearErrorKind,
   clearFinalText,
   clearLog,
   clearOpenAIKey,
+  clearPolishMs,
   clearRawText,
   clearScribeKey,
   clearSessionEndedAt,
   clearSessionStartedAt,
+  clearSttMs,
   ensureRecordingsDir,
   formatLog,
   readAction,
   readError,
+  readErrorKind,
   readFilePath,
   readFinalText,
   readHeartbeat,
   readLog,
   readOpenAIKey,
+  readPolishMs,
   readRawText,
   readScribeKey,
   readSessionEndedAt,
   readSessionStartedAt,
+  readSttMs,
   readState,
+  VBErrorKind,
   vblog,
   vblogErr,
   writeError,
+  writeErrorKind,
   writeFilePath,
   writeFinalText,
   writeHeartbeat,
   writeOpenAIKey,
+  writePolishMs,
   writeRawText,
   writeScribeKey,
   writeSessionEndedAt,
   writeSessionStartedAt,
+  writeSttMs,
   writeState,
 } from "./shared"
 
@@ -102,6 +113,7 @@ async function startRecorder(): Promise<boolean> {
     const msg = `AudioRecorder.create threw: ${String(e)}`
     logErr(msg)
     writeError(msg)
+    writeErrorKind("record")
     return false
   }
   lastRecorderError = null
@@ -109,6 +121,7 @@ async function startRecorder(): Promise<boolean> {
     lastRecorderError = msg
     logErr("recorder.onError:", msg)
     writeError(`recorder.onError: ${msg}`)
+    writeErrorKind("record")
   }
   r.onFinish = (success: boolean) => {
     log("recorder.onFinish success=", success)
@@ -123,6 +136,7 @@ async function startRecorder(): Promise<boolean> {
         : "record() false · no onError fired"
     logErr(msg)
     writeError(msg)
+    writeErrorKind("record")
     try {
       r.dispose()
     } catch {}
@@ -157,9 +171,16 @@ async function startSession(): Promise<void> {
       return
     }
     clearAction()
+    // 归零 activeTree：新 session 起手，让所有键盘树从 activeTree=null
+    // 分支起步（fast poll），等用户下次 tap 再写入新的 TREE_ID。避免
+    // 上一轮残留的 TREE_ID 让新可见树被错误地判成 ghost 而进 slow poll。
+    clearActiveTree()
     clearError()
+    clearErrorKind()
     clearRawText()
     clearFinalText()
+    clearSttMs()
+    clearPolishMs()
     sessionActive = true
     workerCancelled = false
     writeState("armed")
@@ -168,6 +189,7 @@ async function startSession(): Promise<void> {
   } catch (e) {
     logErr("startSession failed:", String(e))
     writeError(`startSession: ${String(e)}`)
+    writeErrorKind("setup")
     sessionActive = false
   }
 }
@@ -187,6 +209,24 @@ async function teardownAudioSession(): Promise<void> {
   }
   sessionActive = false
   workerCancelled = true
+}
+
+// Unified error finalizer. Every failure path in stopAndTranscribe funnels
+// through this so we can't accidentally (a) leave the audio session hot,
+// (b) forget to flip state → done and keep the keyboard hanging in
+// processing forever, or (c) drop the errorKind the keyboard needs for
+// the right `[录音|转录|润色失败: …]` prefix.
+//
+// Safe to call exactly once per session. Does NOT clear rawText — if STT
+// succeeded but polish failed, rawText stays in storage so the keyboard can
+// fall back to inserting the unpolished transcript instead of an error
+// placeholder (user preference: "even raw text beats an error").
+async function abort(kind: VBErrorKind, reason: string): Promise<void> {
+  logErr(`abort · kind=${kind} · reason=${reason}`)
+  writeError(reason)
+  writeErrorKind(kind)
+  writeState("done")
+  await teardownAudioSession()
 }
 
 const POLISH_INSTRUCTIONS = `你是一个语音输入润色助手。把用户口述的中文文本整理成自然流畅的书面或口语表达：
@@ -269,6 +309,7 @@ async function polishWithOpenAI(
   log("openai raw json:", JSON.stringify(json).slice(0, 800))
   const text = extractResponsesText(json)
   log("openai polished len=", text.length, "preview=", text.slice(0, 60))
+  writePolishMs(elapsedMs)
   return text
 }
 
@@ -302,6 +343,7 @@ async function transcribeWithScribe(
   const text = String(json?.text ?? "")
   log("scribe text len=", text.length, "preview=", text.slice(0, 60))
   if (text.length === 0) throw new Error("scribe returned empty text")
+  writeSttMs(elapsedMs)
   return text
 }
 
@@ -332,18 +374,12 @@ async function stopAndTranscribe(): Promise<void> {
   log("state=transcribing")
 
   if (path === null) {
-    logErr("missing recording file path")
-    writeError("录音文件路径丢失")
-    writeState("done")
-    await teardownAudioSession()
+    await abort("setup", "录音文件路径丢失")
     return
   }
   const key = readScribeKey()
   if (key === null || key.length === 0) {
-    logErr("missing ElevenLabs key")
-    writeError("缺少 ElevenLabs key")
-    writeState("done")
-    await teardownAudioSession()
+    await abort("setup", "缺少 ElevenLabs key")
     return
   }
 
@@ -354,9 +390,7 @@ async function stopAndTranscribe(): Promise<void> {
   } catch (e) {
     const msg = String((e as Error)?.message ?? e)
     logErr("transcribe failed:", msg)
-    writeError(`STT: ${msg}`)
-    writeState("done")
-    await teardownAudioSession()
+    await abort("stt", msg)
     return
   }
 
@@ -375,14 +409,14 @@ async function stopAndTranscribe(): Promise<void> {
     writeFinalText(polished)
     writeState("done")
     log("polish ok · state=done · keyboard will consume finalText")
+    await teardownAudioSession()
   } catch (e) {
     const msg = String((e as Error)?.message ?? e)
     logErr("polish failed:", msg)
-    writeError(`polish: ${msg}`)
-    // 注意：rawText 留在 storage，键盘 fallback 到 rawText
-    writeState("done")
+    // rawText 留在 storage — 键盘优先级是 finalText > rawText > errorPlaceholder，
+    // 所以润色失败时用户仍然会看到未润色的原文插入，而不是错误占位。
+    await abort("polish", msg)
   }
-  await teardownAudioSession()
 }
 
 async function resetToIdle(): Promise<void> {
@@ -405,10 +439,18 @@ async function resetToIdle(): Promise<void> {
   sessionActive = false
   workerCancelled = true
   clearAction()
+  // 关键：清空 activeTree。否则上一轮的 TREE_ID 残留在 storage 里，
+  // 下一次进宿主 app 后新可见的键盘树读到非空 activeTree 且不等于自己，
+  // 会被 L3 判成 ghost 进入 slow 5s poll，UI 更新滞后，用户感知为
+  // "键盘卡住、点停止无反应"（但 mic 其实还在录）。
+  clearActiveTree()
   clearSessionStartedAt()
   clearSessionEndedAt()
   clearRawText()
   clearFinalText()
+  clearErrorKind()
+  clearSttMs()
+  clearPolishMs()
   writeState("idle")
 }
 
@@ -494,9 +536,12 @@ function MainView() {
   const sessionEndedAt = readSessionEndedAt()
   const filePath = readFilePath()
   const err = readError()
+  const errKind = readErrorKind()
   const heartbeat = readHeartbeat()
   const rawText = readRawText()
   const finalText = readFinalText()
+  const sttMs = readSttMs()
+  const polishMs = readPolishMs()
   const q = Script.queryParameters ?? {}
   const qpStr = JSON.stringify(q)
   const logEntries = readLog()
@@ -552,6 +597,18 @@ function MainView() {
 
   const scribeKeySet = (readScribeKey() ?? "").length > 0
   const openAIKeySet = (readOpenAIKey() ?? "").length > 0
+
+  const fmtSec = (ms: number): string => (ms / 1000).toFixed(2) + "s"
+  const latencyLine = (() => {
+    if (sttMs === null && polishMs === null) return null
+    const parts: string[] = []
+    if (sttMs !== null) parts.push(`STT ${fmtSec(sttMs)}`)
+    if (polishMs !== null) parts.push(`polish ${fmtSec(polishMs)}`)
+    if (sttMs !== null && polishMs !== null) {
+      parts.push(`合计 ${fmtSec(sttMs + polishMs)}`)
+    }
+    return parts.join(" · ")
+  })()
 
   return (
     <NavigationStack>
@@ -676,7 +733,7 @@ function MainView() {
           {err !== null ? (
             <VStack spacing={4} alignment="leading">
               <Text font="caption" foregroundStyle="red">
-                错误
+                错误{errKind !== null ? ` · ${errKind}` : ""}
               </Text>
               <Text font="footnote" foregroundStyle="red">
                 {err}
@@ -685,6 +742,7 @@ function MainView() {
                 title="清除错误"
                 action={() => {
                   clearError()
+                  clearErrorKind()
                   setTick((v) => v + 1)
                 }}
               />
@@ -695,6 +753,11 @@ function MainView() {
             <Text font="caption" foregroundStyle="secondaryLabel">
               调试
             </Text>
+            {latencyLine !== null ? (
+              <Text font="footnote" foregroundStyle="systemBlue">
+                上次链路耗时 · {latencyLine}
+              </Text>
+            ) : null}
             <Text font="footnote">
               BackgroundKeeper.isActive ={" "}
               {bgActive === null ? "…" : String(bgActive)}
