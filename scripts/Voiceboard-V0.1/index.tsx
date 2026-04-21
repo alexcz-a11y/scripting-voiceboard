@@ -1,8 +1,10 @@
 import {
   Button,
   HStack,
+  LiveActivity,
   Navigation,
   NavigationStack,
+  Path,
   Script,
   ScrollView,
   SecureField,
@@ -12,6 +14,11 @@ import {
   useState,
   VStack,
 } from "scripting"
+
+import {
+  VBActivityState,
+  VoiceboardWarmActivity,
+} from "./live_activity"
 
 import {
   buildRecordingPath,
@@ -500,6 +507,325 @@ async function foregroundTestRecord(): Promise<void> {
   log("---- foregroundTestRecord END · state=done ----")
 }
 
+// ---------------------------------------------------------------------------
+// Stage 4.5a — 保活机制四组合实测
+//
+// 不改现有 `startSession` / `stopAndTranscribe` 等状态机路径，仅新增一组
+// 独立的 "experiment" 入口：A1 / A2 / A3 / A4 分别对应四种保活组合，每组
+// 跑 5 分钟，期间 400ms 写一次 heartbeat，结束后读 heartbeat 首尾时间判
+// 断实际存活时长。
+//
+// 结果用于决定 4.5b 采用方案 C′（裸 keepAlive + LA 够用）还是方案 A
+// （必须额外加静音录音 keeper）。
+// ---------------------------------------------------------------------------
+
+type ExperimentId = "A1" | "A2" | "A3" | "A4"
+type ExperimentCause = "timer" | "cancel" | "error"
+
+type ExperimentResult = {
+  startedAt: number
+  endedAt: number
+  firstHeartbeatAt: number
+  lastHeartbeatAt: number
+  cause: ExperimentCause
+}
+
+const EXPERIMENT_DURATION_MS = 5 * 60 * 1000
+const EXPERIMENT_TICK_MS = 400
+
+let silentKeeper: AudioRecorder | null = null
+let expRunning: ExperimentId | null = null
+let expStartedAt = 0
+let expEndAt = 0
+let expFirstHeartbeatAt = 0
+let expLastHeartbeatAt = 0
+let expActivity: LiveActivity<VBActivityState> | null = null
+let expCancelled = false
+const expResults: Partial<Record<ExperimentId, ExperimentResult>> = {}
+
+async function teardownExperiment(): Promise<void> {
+  if (silentKeeper !== null) {
+    try {
+      silentKeeper.stop()
+    } catch (e) {
+      logErr("exp: silentKeeper.stop:", String(e))
+    }
+    try {
+      silentKeeper.dispose()
+    } catch (e) {
+      logErr("exp: silentKeeper.dispose:", String(e))
+    }
+    silentKeeper = null
+  }
+  if (expActivity !== null) {
+    try {
+      await expActivity.end(
+        {
+          status: "ended",
+          remainingSec: 0,
+          label: expRunning ?? undefined,
+        },
+        { dismissTimeInterval: 0 }
+      )
+      log("exp: activity.end OK (immediate dismiss)")
+    } catch (e) {
+      logErr("exp: activity.end:", String(e))
+    }
+    expActivity = null
+  }
+  try {
+    await BackgroundKeeper.stopKeepAlive()
+    log("exp: stopKeepAlive OK")
+  } catch (e) {
+    logErr("exp: stopKeepAlive:", String(e))
+  }
+  try {
+    await SharedAudioSession.setActive(false)
+    log("exp: setActive(false) OK")
+  } catch (e) {
+    logErr("exp: setActive(false):", String(e))
+  }
+}
+
+async function startSilentKeeperForExperiment(id: ExperimentId): Promise<boolean> {
+  try {
+    const dir = await ensureRecordingsDir()
+    const path = Path.join(dir, "warm_keeper.m4a")
+    log(`4.5a-${id}: silentKeeper path=`, path)
+    const r = await AudioRecorder.create(path, {
+      format: "MPEG4AAC",
+      sampleRate: 22050,
+      numberOfChannels: 1,
+      encoderAudioQuality: AVAudioQuality.low,
+    })
+    r.onError = (m: string) =>
+      logErr(`4.5a-${id}: silentKeeper.onError:`, m)
+    r.onFinish = (ok: boolean) =>
+      log(`4.5a-${id}: silentKeeper.onFinish ok=`, ok)
+    const ok = r.record()
+    log(`4.5a-${id}: silentKeeper.record()=`, ok, "isRecording=", r.isRecording)
+    if (!ok) {
+      try {
+        r.dispose()
+      } catch {}
+      return false
+    }
+    silentKeeper = r
+    return true
+  } catch (e) {
+    logErr(`4.5a-${id}: silentKeeper create/record failed:`, String(e))
+    return false
+  }
+}
+
+async function runExperiment(id: ExperimentId): Promise<void> {
+  if (expRunning !== null) {
+    log(`4.5a-${id}: another experiment (${expRunning}) is running; bail`)
+    return
+  }
+  if (sessionActive) {
+    log(`4.5a-${id}: main session active; bail`)
+    return
+  }
+
+  const startedAt = Date.now()
+  const endAt = startedAt + EXPERIMENT_DURATION_MS
+
+  expRunning = id
+  expStartedAt = startedAt
+  expEndAt = endAt
+  expFirstHeartbeatAt = 0
+  expLastHeartbeatAt = 0
+  expCancelled = false
+  delete expResults[id]
+
+  log(
+    `---- 4.5a-${id} START · duration ${EXPERIMENT_DURATION_MS / 1000}s ` +
+      `· endAt=${endAt} ----`
+  )
+
+  try {
+    // 所有实验都共用这部分
+    await configureAudioSession()
+    await BackgroundKeeper.keepAlive()
+    log(`4.5a-${id}: keepAlive OK`)
+
+    // A2 / A4：带 Live Activity
+    if (id === "A2" || id === "A4") {
+      try {
+        const activity = VoiceboardWarmActivity()
+        const ok = await activity.start({
+          status: `exp-${id}`,
+          remainingSec: Math.floor(EXPERIMENT_DURATION_MS / 1000),
+          label: id,
+        })
+        log(`4.5a-${id}: activity.start =>`, ok)
+        expActivity = activity
+      } catch (e) {
+        logErr(`4.5a-${id}: activity.start failed:`, String(e))
+        // 带 LA 的实验启动不了 LA 就不能继续 —— 否则跑的其实是 A1/A3
+        expRunning = null
+        await teardownExperiment()
+        expResults[id] = {
+          startedAt,
+          endedAt: Date.now(),
+          firstHeartbeatAt: 0,
+          lastHeartbeatAt: 0,
+          cause: "error",
+        }
+        return
+      }
+    }
+
+    // A3 / A4：带静音 keeper recorder
+    if (id === "A3" || id === "A4") {
+      const ok = await startSilentKeeperForExperiment(id)
+      if (!ok) {
+        expRunning = null
+        await teardownExperiment()
+        expResults[id] = {
+          startedAt,
+          endedAt: Date.now(),
+          firstHeartbeatAt: 0,
+          lastHeartbeatAt: 0,
+          cause: "error",
+        }
+        return
+      }
+    }
+
+    scheduleExperimentTick(id)
+  } catch (e) {
+    logErr(`4.5a-${id}: setup failed:`, String(e))
+    expRunning = null
+    await teardownExperiment()
+    expResults[id] = {
+      startedAt,
+      endedAt: Date.now(),
+      firstHeartbeatAt: 0,
+      lastHeartbeatAt: 0,
+      cause: "error",
+    }
+  }
+}
+
+function scheduleExperimentTick(id: ExperimentId): void {
+  if (expCancelled || expRunning !== id) return
+  setTimeout(() => {
+    experimentTick(id)
+  }, EXPERIMENT_TICK_MS)
+}
+
+async function experimentTick(id: ExperimentId): Promise<void> {
+  if (expCancelled || expRunning !== id) return
+  const now = Date.now()
+
+  // iOS 把 Scripting 挂起时 setTimeout 暂停；app 恢复时首个 tick 会带一个
+  // 巨大的 gap（>> 400ms）。检测到就把"真实存活"标记在上一次 heartbeat
+  // 处收尾 —— 否则 lastHeartbeatAt 会被恢复后的新 heartbeat 覆盖，把"存活
+  // 时长"夸大到包含了整个挂起时间。
+  const gap = expLastHeartbeatAt > 0 ? now - expLastHeartbeatAt : 0
+  if (gap > 2000) {
+    log(
+      `4.5a-${id}: suspension detected · gap=${gap}ms · ` +
+        `freezing lastHeartbeat at ${expLastHeartbeatAt} and ending`
+    )
+    await finishExperiment(id, "timer")
+    return
+  }
+
+  // heartbeat —— 同时给主 UI 的 "heartbeat Xs ago" 显示用
+  writeHeartbeat()
+  if (expFirstHeartbeatAt === 0) expFirstHeartbeatAt = now
+  expLastHeartbeatAt = now
+
+  // 每 ~1s log 一次，降低日志噪声；所有 tick 都参与 heartbeat
+  const elapsedMs = now - expStartedAt
+  if (elapsedMs % 1000 < EXPERIMENT_TICK_MS) {
+    log(
+      `4.5a-${id}: tick · elapsed=${(elapsedMs / 1000).toFixed(1)}s ` +
+        `· remaining=${((expEndAt - now) / 1000).toFixed(1)}s`
+    )
+  }
+
+  // Live Activity update（只有 A2/A4 有 activity）—— 节流到 ~1s/次
+  if (expActivity !== null && elapsedMs % 1000 < EXPERIMENT_TICK_MS) {
+    const remaining = Math.max(0, Math.floor((expEndAt - now) / 1000))
+    try {
+      await expActivity.update({
+        status: `exp-${id}`,
+        remainingSec: remaining,
+        label: id,
+      })
+    } catch (e) {
+      logErr(`4.5a-${id}: activity.update failed:`, String(e))
+    }
+  }
+
+  if (now >= expEndAt) {
+    log(`4.5a-${id}: timer expired`)
+    await finishExperiment(id, "timer")
+    return
+  }
+
+  scheduleExperimentTick(id)
+}
+
+async function finishExperiment(
+  id: ExperimentId,
+  cause: ExperimentCause
+): Promise<void> {
+  const endedAt = Date.now()
+  expResults[id] = {
+    startedAt: expStartedAt,
+    endedAt,
+    firstHeartbeatAt: expFirstHeartbeatAt,
+    lastHeartbeatAt: expLastHeartbeatAt,
+    cause,
+  }
+  const durS = ((endedAt - expStartedAt) / 1000).toFixed(1)
+  const hbS =
+    expFirstHeartbeatAt > 0
+      ? ((expLastHeartbeatAt - expFirstHeartbeatAt) / 1000).toFixed(1)
+      : "—"
+  log(
+    `---- 4.5a-${id} END · cause=${cause} · wallDur=${durS}s ` +
+      `· heartbeatDur=${hbS}s ----`
+  )
+  expRunning = null
+  await teardownExperiment()
+}
+
+async function cancelExperiment(): Promise<void> {
+  if (expRunning === null) return
+  const id = expRunning
+  expCancelled = true
+  await finishExperiment(id, "cancel")
+}
+
+// Script.onResume 路径验证：已存活实例通过 `scripting://run/...` 触发时
+// 会进这里，且不会重跑入口文件（reference/llms-full.md:29303-29311）。
+// Stage 4.5b 的键盘 warm fast-path 就依赖这个特性。
+let onResumeRemover: (() => void) | null = null
+
+function registerOnResumeListener(): void {
+  if (onResumeRemover !== null) return
+  try {
+    onResumeRemover = Script.onResume((details) => {
+      log("onResume fired · details=", JSON.stringify(details))
+      const q = details.queryParameters
+      if (q && q.probe === "1") {
+        log(
+          "onResume · probe=1 detected · 既有实例仍存活，没有重跑入口"
+        )
+      }
+    })
+    log("Script.onResume listener registered")
+  } catch (e) {
+    logErr("Script.onResume register failed:", String(e))
+  }
+}
+
 function MainView() {
   const dismiss = Navigation.useDismiss()
   const [tick, setTick] = useState(0)
@@ -749,6 +1075,127 @@ function MainView() {
             </VStack>
           ) : null}
 
+          <VStack spacing={6} alignment="leading">
+            <Text font="caption" foregroundStyle="secondaryLabel">
+              4.5a 实验 · 保活机制实测（不影响正常录音链路）
+            </Text>
+            {(["A1", "A2", "A3", "A4"] as ExperimentId[]).map((id) => {
+              const r = expResults[id]
+              const label =
+                id === "A1"
+                  ? "A1 · 裸 keepAlive"
+                  : id === "A2"
+                  ? "A2 · keepAlive + Live Activity"
+                  : id === "A3"
+                  ? "A3 · keepAlive + 静音录音"
+                  : "A4 · keepAlive + LA + 静音录音（官方组合）"
+              const result =
+                r === undefined
+                  ? "—"
+                  : r.firstHeartbeatAt === 0
+                  ? `error at ${((r.endedAt - r.startedAt) / 1000).toFixed(1)}s`
+                  : `存活 ${(
+                      (r.lastHeartbeatAt - r.firstHeartbeatAt) /
+                      1000
+                    ).toFixed(1)}s · ${r.cause}`
+              return (
+                <Text
+                  key={id}
+                  font="footnote"
+                  foregroundStyle="systemBlue"
+                >
+                  {label}: {result}
+                </Text>
+              )
+            })}
+            {expRunning !== null ? (
+              <Text font="footnote" foregroundStyle="orange">
+                {expRunning} 运行中 · 剩余{" "}
+                {Math.max(
+                  0,
+                  Math.floor((expEndAt - Date.now()) / 1000)
+                )}
+                s · 首 heartbeat 后持续{" "}
+                {expFirstHeartbeatAt > 0
+                  ? (
+                      (Date.now() - expFirstHeartbeatAt) /
+                      1000
+                    ).toFixed(1)
+                  : "—"}
+                s
+              </Text>
+            ) : null}
+            <Button
+              title="A1 · 裸 keepAlive"
+              action={() => {
+                if (expRunning !== null || sessionActive) {
+                  log("A1 tap ignored · busy")
+                  return
+                }
+                runExperiment("A1")
+                setTick((t) => t + 1)
+              }}
+            />
+            <Button
+              title="A2 · keepAlive + Live Activity"
+              action={() => {
+                if (expRunning !== null || sessionActive) {
+                  log("A2 tap ignored · busy")
+                  return
+                }
+                runExperiment("A2")
+                setTick((t) => t + 1)
+              }}
+            />
+            <Button
+              title="A3 · keepAlive + 静音录音"
+              action={() => {
+                if (expRunning !== null || sessionActive) {
+                  log("A3 tap ignored · busy")
+                  return
+                }
+                runExperiment("A3")
+                setTick((t) => t + 1)
+              }}
+            />
+            <Button
+              title="A4 · keepAlive + LA + 静音录音（官方组合）"
+              action={() => {
+                if (expRunning !== null || sessionActive) {
+                  log("A4 tap ignored · busy")
+                  return
+                }
+                runExperiment("A4")
+                setTick((t) => t + 1)
+              }}
+            />
+            {expRunning !== null ? (
+              <Button
+                title="提前结束当前实验"
+                action={async () => {
+                  await cancelExperiment()
+                  setTick((t) => t + 1)
+                }}
+              />
+            ) : null}
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              Script.onResume 路径测试：点下方按钮拷贝 URL 到剪贴板，切到备忘录
+              粘贴并点击链接，应看到日志新增 "onResume fired"，且**没有**
+              "script run · env=" 表示实例没重跑入口文件。
+            </Text>
+            <Button
+              title="拷贝 scripting://run/Voiceboard-V0.1?probe=1"
+              action={async () => {
+                const url = `scripting://run/${encodeURIComponent(
+                  Script.name
+                )}?probe=1`
+                await Pasteboard.setString(url)
+                log("onResume probe URL copied:", url)
+                setTick((t) => t + 1)
+              }}
+            />
+          </VStack>
+
           <VStack spacing={4} alignment="leading">
             <Text font="caption" foregroundStyle="secondaryLabel">
               调试
@@ -765,6 +1212,9 @@ function MainView() {
             <Text font="footnote">sessionActive = {String(sessionActive)}</Text>
             <Text font="footnote">
               recorder != null = {String(recorder !== null)}
+            </Text>
+            <Text font="footnote">
+              silentKeeper != null = {String(silentKeeper !== null)}
             </Text>
             <Text font="footnote">heartbeat {heartbeatAgo}s ago</Text>
             <Text font="footnote">queryParameters = {qpStr}</Text>
@@ -815,6 +1265,9 @@ async function run() {
     Script.exit()
     return
   }
+  // 在 Navigation.present 之前注册 onResume，这样在 MainView 可见期间
+  // 任何 scripting://run/... 触发都能走到 listener，不会丢事件。
+  registerOnResumeListener()
   await Navigation.present({ element: <MainView /> })
   log("script exit")
   Script.exit()
