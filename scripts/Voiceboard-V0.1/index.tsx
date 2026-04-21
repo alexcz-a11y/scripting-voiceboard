@@ -327,6 +327,15 @@ function MainView() {
       ? `done · 时长 ${finalDurSec}s（等待键盘插入）`
       : state
 
+  const statusColor: "orange" | "systemGreen" | "systemRed" | "label" =
+    err !== null
+      ? "systemRed"
+      : state === "armed"
+      ? "orange"
+      : state === "done"
+      ? "systemGreen"
+      : "label"
+
   return (
     <NavigationStack>
       <ScrollView
@@ -344,19 +353,33 @@ function MainView() {
             <Text font="caption" foregroundStyle="secondaryLabel">
               状态
             </Text>
-            <Text font="title">{statusLabel}</Text>
+            <Text font="title" foregroundStyle={statusColor}>
+              {statusLabel}
+            </Text>
           </VStack>
 
-          {state === "idle" ? (
-            <Button title="开启录音会话（前台）" action={startSession} />
-          ) : (
-            <Button title="强制终止会话" action={onEnd} />
-          )}
-
-          <Button
-            title="🔬 前台测试录音 2 秒"
-            action={foregroundTestRecord}
-          />
+          <VStack spacing={8} alignment="leading">
+            <Text font="caption" foregroundStyle="secondaryLabel">
+              操作
+            </Text>
+            {state === "idle" ? (
+              <Button title="开启录音会话（前台）" action={startSession} />
+            ) : (
+              <Button title="强制终止会话" action={onEnd} />
+            )}
+            <Button
+              title="🔬 前台测试录音 2 秒"
+              action={foregroundTestRecord}
+            />
+            <Button
+              title="清除状态（重置到 idle）"
+              action={async () => {
+                await resetToIdle()
+                clearError()
+                setTick((v) => v + 1)
+              }}
+            />
+          </VStack>
 
           {state === "armed" ? (
             <Text foregroundStyle="secondaryLabel">
@@ -422,17 +445,6 @@ function MainView() {
               lastRecorderError = {lastRecorderError ?? "—"}
             </Text>
           </VStack>
-
-          <HStack spacing={10}>
-            <Button
-              title="清除状态"
-              action={async () => {
-                await resetToIdle()
-                clearError()
-                setTick((v) => v + 1)
-              }}
-            />
-          </HStack>
 
           <VStack spacing={6} alignment="leading">
             <HStack spacing={8}>
