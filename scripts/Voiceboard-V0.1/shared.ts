@@ -13,6 +13,9 @@ export const K_OPENAI_KEY = "vb:openAIKey"
 export const K_RAW_TEXT = "vb:rawText"
 export const K_FINAL_TEXT = "vb:finalText"
 export const K_ACTIVE_TREE = "vb:activeTree"
+export const K_ERROR_KIND = "vb:errorKind"
+export const K_STT_MS = "vb:sttMs"
+export const K_POLISH_MS = "vb:polishMs"
 
 export const RECORDINGS_SUBDIR = "Voiceboard"
 
@@ -23,6 +26,13 @@ export type VBState =
   | "polishing"
   | "done"
 export type VBAction = "stop"
+// Error classification for unified abort() handling:
+//   setup  — pre-flight failure (missing key, missing file path, etc.)
+//   record — AudioRecorder create / start / mid-recording failure
+//   stt    — ElevenLabs Scribe request failure
+//   polish — OpenAI Responses request failure (STT already succeeded)
+// Keyboard uses this to render the right `[录音失败|转录失败|润色失败: …]` prefix.
+export type VBErrorKind = "setup" | "record" | "stt" | "polish"
 
 const opts = { shared: true } as const
 
@@ -100,6 +110,46 @@ export function writeError(msg: string): void {
 
 export function clearError(): void {
   Storage.remove(K_ERROR, opts)
+}
+
+export function readErrorKind(): VBErrorKind | null {
+  return (Storage.get<VBErrorKind>(K_ERROR_KIND, opts) as VBErrorKind | null) ?? null
+}
+
+export function writeErrorKind(kind: VBErrorKind): void {
+  Storage.set(K_ERROR_KIND, kind, opts)
+}
+
+export function clearErrorKind(): void {
+  Storage.remove(K_ERROR_KIND, opts)
+}
+
+// Per-stage latency, written by index.tsx after each successful HTTP call.
+// Preserved across sessions so the main-app debug area can show
+// "上次链路耗时: STT Xs · polish Ys" — cleared at the start of the next
+// startSession().
+export function readSttMs(): number | null {
+  return Storage.get<number>(K_STT_MS, opts) ?? null
+}
+
+export function writeSttMs(ms: number): void {
+  Storage.set(K_STT_MS, ms, opts)
+}
+
+export function clearSttMs(): void {
+  Storage.remove(K_STT_MS, opts)
+}
+
+export function readPolishMs(): number | null {
+  return Storage.get<number>(K_POLISH_MS, opts) ?? null
+}
+
+export function writePolishMs(ms: number): void {
+  Storage.set(K_POLISH_MS, ms, opts)
+}
+
+export function clearPolishMs(): void {
+  Storage.remove(K_POLISH_MS, opts)
 }
 
 export function readScribeKey(): string | null {
