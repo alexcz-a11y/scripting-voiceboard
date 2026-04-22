@@ -1,12 +1,15 @@
 import {
   Button,
   HStack,
+  Image,
+  Picker,
   Script,
   Spacer,
   Text,
   useEffect,
   useState,
   VStack,
+  ZStack,
 } from "scripting"
 
 import {
@@ -17,16 +20,20 @@ import {
   clearRawText,
   clearSessionEndedAt,
   clearSessionStartedAt,
+  InputMode,
   readActiveTree,
   readError,
   readErrorKind,
   readFilePath,
   readFinalText,
   readHeartbeat,
+  readInputMode,
   readRawText,
   readSessionEndedAt,
   readSessionStartedAt,
   readState,
+  readTune,
+  readTuneBool,
   readWarmUntil,
   VBErrorKind,
   VBState,
@@ -34,6 +41,7 @@ import {
   vblogErr,
   writeAction,
   writeActiveTree,
+  writeInputMode,
 } from "./shared"
 
 function log(...args: unknown[]): void {
@@ -72,6 +80,90 @@ function classify(state: VBState): Mode {
   return "other"
 }
 
+// Stage 6a — Voiceboard Ink 品牌色（dynamic light/dark）。
+//
+// 用 DynamicShapeStyle 形式 `{ light, dark }`（dts:1488），iOS 自动按设备外观
+// 切换。值是 hex 字符串，Color = ColorStringHex | RGBA | KeywordsColor (dts:1039)。
+//
+// 规约：accent 色用于按钮主色 / pill / status tag；fg2 用于 secondary 文字。
+const C_PRIMARY = { light: "#4F6BE8", dark: "#7C93FF" } as const  // warm 蓝
+const C_URGENT  = { light: "#FF4B55", dark: "#FF6B72" } as const  // armed 红
+const C_PROCESS = { light: "#F59E0B", dark: "#FBBF24" } as const  // transcribing/polishing 橘
+const C_SUCCESS = { light: "#10B981", dark: "#34D399" } as const  // done 绿
+const C_ERROR   = { light: "#DC2626", dark: "#F87171" } as const  // 错误红
+const C_NEUTRAL = { light: "#6B7280", dark: "#A1A1AA" } as const  // idle / 默认灰
+
+// 给定 mode + 是否有错误，返回该 state 的主调色板 token。错误优先级最高。
+function accentFor(mode: Mode, hasErr: boolean): { light: string; dark: string } {
+  if (hasErr) return C_ERROR
+  switch (mode) {
+    case "warm":      return C_PRIMARY
+    case "recording": return C_URGENT
+    case "processing": return C_PROCESS
+    case "done":      return C_SUCCESS
+    default:          return C_NEUTRAL
+  }
+}
+
+// 主胶囊麦克风按钮在每个 state 显示的 SF Symbol。
+function micSymbolFor(mode: Mode, state: VBState, hasErr: boolean): string {
+  if (hasErr) return "exclamationmark.triangle.fill"
+  switch (mode) {
+    case "warm":
+    case "idle":      return "mic.fill"
+    case "recording": return "stop.fill"
+    case "processing": return "arrow.triangle.2.circlepath"
+    case "done":      return "checkmark"
+    default:          return "mic.fill"
+  }
+}
+
+// 主胶囊麦克风按钮文案。
+function micCapsuleLabel(mode: Mode, state: VBState, hasErr: boolean): string {
+  if (hasErr) return "出错 · 清除"
+  switch (mode) {
+    case "idle":      return "开始录音"
+    case "warm":      return "开始录音"
+    case "recording": return "结束录音"
+    case "processing": return state === "transcribing" ? "转录中…" : "润色中…"
+    case "done":      return "已插入"
+    default:          return "开始录音"
+  }
+}
+
+// 顶部左侧 status tag 的短文案（带前缀符号）。
+function statusTagText(mode: Mode, hasErr: boolean): string {
+  if (hasErr) return "错误"
+  switch (mode) {
+    case "warm":      return "保持中"
+    case "recording": return "录音中"
+    case "processing": return "处理中"
+    case "done":      return "已完成"
+    case "idle":      return "未就绪"
+    default:          return "—"
+  }
+}
+
+// 顶部右侧的 mono 副信息（mm:ss / 3.4s / Scribe v2 / etc）。
+function rightLabelText(
+  mode: Mode,
+  state: VBState,
+  warmRemainingSec: number,
+  recordingElapsedSec: number,
+  hasErr: boolean,
+  errKind: VBErrorKind | null
+): string {
+  if (hasErr) return errKind ?? "?"
+  switch (mode) {
+    case "warm":      return fmtMMSS(warmRemainingSec)
+    case "recording": return `${recordingElapsedSec.toFixed(1)}s`
+    case "processing": return state === "transcribing" ? "Scribe v2" : "gpt-5.4-mini"
+    case "done":      return "已插入"
+    case "idle":      return "idle"
+    default:          return state
+  }
+}
+
 function fmtMMSS(sec: number): string {
   const s = Math.max(0, Math.floor(sec))
   const m = Math.floor(s / 60)
@@ -95,11 +187,21 @@ function VoiceboardKeyboard() {
   const [coldStartAt, setColdStartAt] = useState<number | null>(null)
   const [openURLResult, setOpenURLResult] = useState<string | null>(null)
   const [prevMode, setPrevMode] = useState<Mode | null>(null)
+  // Stage 6a — 顶部「口述 / 自动 / 翻译」3 段切换 pill 当前值。
+  // 用原生 Picker + pickerStyle="segmented", iOS 26 自带 Liquid Glass 滑动
+  // 动画由 SwiftUI 系统内部处理, React useState 即可, 不需要 Observable +
+  // withAnimation 自拼 matchedGeometry.
+  const [inputMode, setInputMode] = useState<InputMode>("auto")
   // wakeRef holds a per-instance reference to the "wake from slow poll"
   // function. onMicTap mutates wakeRef.wake to invoke it after writing the
   // new activeTree id, so a ghost-mode tree that the user just tapped
   // immediately switches to fast polling instead of waiting 5s.
   const [wakeRef] = useState<{ wake: () => void }>(() => ({ wake: () => {} }))
+
+  // 启动时一次性从 Storage 读 inputMode（处理从 idle 冷启 / 主 app 改过的情况）
+  useEffect(() => {
+    setInputMode(readInputMode())
+  }, [])
 
   // L3 (Stage 3.5, v2): self-suspending poll loop.
   //
@@ -135,6 +237,10 @@ function VoiceboardKeyboard() {
     const poll = () => {
       if (cancelled) return
       setTick((v) => v + 1)
+      // Stage 6a — 顺带把 inputMode 拉新一次，让"主 app 改了 pill → 键盘
+      // 同步"在 400ms (fast) / 5000ms (slow ghost) 内生效。setState 同值
+      // 会被 React 自动 bail out，不会无谓重渲染。
+      setInputMode(readInputMode())
       const stateNow = readState()
       const activeTree = readActiveTree()
       // Stage 4.5b — warm 窗口内也必须 fast poll，否则用户看到的倒计时
@@ -197,7 +303,6 @@ function VoiceboardKeyboard() {
   const filePath = readFilePath()
   const err = readError()
   const errKind = readErrorKind()
-  const heartbeat = readHeartbeat()
   const rawText = readRawText()
   const finalText = readFinalText()
   // Stage 4.5b — warm 剩余秒数（给 statusLine 显示）。warmUntil 过期也当
@@ -348,56 +453,9 @@ function VoiceboardKeyboard() {
     errKind,
   ])
 
-  const coldStartTimedOut =
-    coldStartAt !== null &&
-    now - coldStartAt > COLD_START_WAIT_MS &&
-    mode === "idle"
-
-  const statusLine = (() => {
-    if (err !== null) return `错误 · ${err}`
-    if (coldStartTimedOut) {
-      return "无法从键盘唤起 · 请手动打开 Scripting → Voiceboard → 开启会话"
-    }
-    if (coldStartAt !== null && mode === "idle") return "正在唤起 Voiceboard…"
-    switch (mode) {
-      case "idle":
-        return "未就绪 · 点麦克风开始录音"
-      case "warm":
-        return `保持中 · 剩余 ${fmtMMSS(warmRemainingSec)} · 点麦克风直接录音`
-      case "recording": {
-        const sec =
-          sessionStartedAt !== null
-            ? ((now - sessionStartedAt) / 1000).toFixed(1)
-            : "?"
-        return `录音中 · ${sec}s · 点击停止并插入`
-      }
-      case "processing":
-        return state === "transcribing" ? "转录中…" : "润色中…"
-      case "done":
-        return "等待插入…"
-      default:
-        return state
-    }
-  })()
-
-  const micLabel = (() => {
-    switch (mode) {
-      case "idle":
-        return "🎙 开始"
-      case "warm":
-        // 区别于 idle 的"开始"：warm 下键盘是"热启动"，文案给用户"马上录"
-        // 的心智，和 Typeless 对齐。
-        return "🎙 录音"
-      case "recording":
-        return "■ 停止"
-      case "processing":
-        return state === "transcribing" ? "… 转录中" : "… 润色中"
-      case "done":
-        return "… 插入中"
-      default:
-        return "?"
-    }
-  })()
+  // Stage 6a — 原 statusLine / micLabel IIFE 在 Stage 6a return 树重写中废弃：
+  // 文案改由 statusTagText / rightLabelText / micCapsuleLabel 顶层 helper 拿。
+  // coldStartAt state 仍保留（onMicTap 写入），供日后恢复"无法唤起"UX 用。
 
   const micDisabled = mode === "done" || mode === "processing"
 
@@ -518,48 +576,247 @@ function VoiceboardKeyboard() {
     }
   }
 
-  const heartbeatFresh =
-    heartbeat !== null && now - heartbeat < 2000 ? "✓" : "✗"
+  // Stage 6a — 派生渲染态。所有 UI 文案/色/图标都经 helper 函数统一 derive，
+  // 便于同步修改 / 避免散落在 JSX 里的条件分支。
+  const hasErr = err !== null
+  const accent = accentFor(mode, hasErr)
+  const recordingElapsedSec =
+    sessionStartedAt !== null ? (now - sessionStartedAt) / 1000 : 0
+  const tagText = statusTagText(mode, hasErr)
+  const rightText = rightLabelText(
+    mode,
+    state,
+    warmRemainingSec,
+    recordingElapsedSec,
+    hasErr,
+    errKind
+  )
+  const micSym = micSymbolFor(mode, state, hasErr)
+  const micText = micCapsuleLabel(mode, state, hasErr)
+  const errShort =
+    hasErr && err !== null
+      ? err.length > 28
+        ? err.slice(0, 28) + "…"
+        : err
+      : null
+
+  // 模式 pill tap handler：UI 即刻反馈 + 持久化写 Storage。同值 noop。
+  // 动画由原生 segmented Picker 内部处理, 我们只管状态 + 副作用.
+  const onPickMode = (m: InputMode) => {
+    if (m === inputMode) return
+    log("inputMode pick", m)
+    setInputMode(m)
+    writeInputMode(m)
+  }
+
+  // Stage 6a — 调参面板实时生效的布局参数。每次 render 读一遍 Storage；主 app
+  // 调滑杆 → ≤400ms 后键盘同步生效（L3 poll 驱动 re-render）。默认值就是
+  // 当前设计锁定的参数，不设 Storage 时与硬编码等价。
+  const tune = {
+    // — 外层 VStack —
+    outerPadH:          readTune("outer.padH",          12),
+    outerPadTop:        readTune("outer.padTop",        10),
+    outerPadBottom:     readTune("outer.padBottom",     10),
+    outerRowSpacing:    readTune("outer.rowSpacing",    10),
+    // — 顶行 —
+    topRowSpacing:      readTune("top.rowSpacing",       8),
+    topTagMainSubGap:   readTune("top.tagMainSubGap",    1),  // 主文字↔副错误码行距（替原 spacing={1} 硬编码）
+    // — 状态标签（左上） —
+    tagIconSize:        readTune("tag.iconSize",        12),
+    tagTextSize:        readTune("tag.textSize",        12),
+    tagSubTextSize:     readTune("tag.subTextSize",     11),
+    tagInnerSpacing:    readTune("tag.innerSpacing",     4),
+    tagOffsetX:         readTune("tag.offsetX",          9),
+    tagOffsetY:         readTune("tag.offsetY",          0),
+    // — 模式切换 pill —
+    // SwiftUI segmented Picker 默认撑满父容器；必须手动 frame.width 收敛，
+    // 否则 ZStack 满宽时 pill 会盖住左上 tag 和右上 mono 文字。
+    pillWidth:          readTune("pill.width",         178),
+    pillContainerPad:   readTune("pill.containerPad",    3),
+    pillSegSpacing:     readTune("pill.segSpacing",      2),
+    pillSegHPad:        readTune("pill.segHPad",        11),
+    pillSegVPad:        readTune("pill.segVPad",         4),
+    pillSegTextSize:    readTune("pill.segTextSize",    12),
+    pillOffsetX:        readTune("pill.offsetX",         0),  // ZStack 居中后再水平偏移
+    pillOffsetY:        readTune("pill.offsetY",         0),
+    // — 右上时码 mono label —
+    monoTextSize:       readTune("mono.textSize",       14),
+    monoOffsetX:        readTune("mono.offsetX",        -9),
+    monoOffsetY:        readTune("mono.offsetY",         0),
+    // — 主胶囊麦克风 —
+    micMinWidth:        readTune("mic.minWidth",       167),
+    micHeight:          readTune("mic.height",          59),
+    micPadH:            readTune("mic.padH",            26),
+    micIconTextGap:     readTune("mic.iconTextGap",     10),
+    micIconSize:        readTune("mic.iconSize",        20),
+    micTextSize:        readTune("mic.textSize",        17),
+    micOffsetX:         readTune("mic.offsetX",          0),
+    micOffsetY:         readTune("mic.offsetY",          0),
+    // — 键盘容器（系统层 CustomKeyboard.* API 参数）—
+    kbdHeight:          readTune("kbd.height",         199),  // requestHeight
+  }
+
+  // 布尔型 tune（用 readTuneBool 因为 readTune 只收 number）。
+  // 都对应 CustomKeyboard.* 系统 API：
+  //   kbdHasDictation  → setHasDictationKey(value)  iOS 系统麦克风键显隐
+  //   kbdToolbarVisible → setToolbarVisible(value)  Scripting 调试工具栏显隐
+  const kbdHasDictation = readTuneBool("kbd.hasDictation", true)
+  const kbdToolbarVisible = readTuneBool("kbd.toolbarVisible", false)
+
+  // 应用 3 个系统键盘参数。useEffect deps 走值比较（Object.is），
+  // 同值再 render 不触发副作用 → 不会每 400ms 轮询一次就 call 一次 iOS API。
+  useEffect(() => {
+    try {
+      CustomKeyboard.setHasDictationKey(kbdHasDictation)
+    } catch (e) {
+      logErr("setHasDictationKey failed:", String(e))
+    }
+  }, [kbdHasDictation])
+
+  useEffect(() => {
+    try {
+      CustomKeyboard.setToolbarVisible(kbdToolbarVisible)
+    } catch (e) {
+      logErr("setToolbarVisible failed:", String(e))
+    }
+  }, [kbdToolbarVisible])
+
+  useEffect(() => {
+    try {
+      CustomKeyboard.requestHeight(tune.kbdHeight)
+    } catch (e) {
+      logErr("requestHeight failed:", String(e))
+    }
+  }, [tune.kbdHeight])
 
   return (
-    <VStack spacing={10} padding={12}>
-      <Text font="footnote" foregroundStyle="secondaryLabel">
-        {statusLine}
-      </Text>
+    <VStack
+      spacing={tune.outerRowSpacing}
+      padding={{
+        horizontal: tune.outerPadH,
+        top: tune.outerPadTop,
+        bottom: tune.outerPadBottom,
+      }}
+    >
+      {/* ---- 顶行：ZStack 精确居中模式 pill，不受左右 tag/mono 宽度变化影响 ----
+           ZStack 默认 alignment=center，两层均水平居中于键盘宽度：
+             - 底层 HStack [tag | Spacer | mono]：Spacer 撑满使 tag 靠左、mono 靠右
+             - 顶层 Pill：天然居中于 ZStack，可用 offset.x 微调（tune.pillOffsetX）
+           过去用单层 HStack [tag, Spacer, pill, Spacer, mono] 时 pill 位置会
+           随 tag / mono 宽度变化漂移——state 切换时肉眼可见抖动。ZStack 根治。 */}
+      <ZStack>
+        <HStack spacing={tune.topRowSpacing}>
+          <VStack
+            alignment="leading"
+            spacing={tune.topTagMainSubGap}
+            offset={{ x: tune.tagOffsetX, y: tune.tagOffsetY }}
+          >
+            <HStack spacing={tune.tagInnerSpacing}>
+              <Image
+                systemName={
+                  hasErr
+                    ? "exclamationmark.triangle.fill"
+                    : mode === "warm"
+                      ? "waveform.badge.mic"
+                      : mode === "recording"
+                        ? "circle.fill"
+                        : mode === "processing"
+                          ? "arrow.triangle.2.circlepath"
+                          : mode === "done"
+                            ? "checkmark.circle.fill"
+                            : "circle"
+                }
+                font={tune.tagIconSize}
+                foregroundStyle={accent}
+              />
+              <Text
+                font={tune.tagTextSize}
+                fontWeight="semibold"
+                foregroundStyle={accent}
+              >
+                {tagText}
+              </Text>
+            </HStack>
+            {errShort !== null ? (
+              <Text font={tune.tagSubTextSize} foregroundStyle={accent}>
+                {errShort}
+              </Text>
+            ) : null}
+          </VStack>
 
-      <HStack spacing={12}>
-        <Button
-          title="切系统键盘"
-          action={() => CustomKeyboard.nextKeyboard()}
-        />
-        <Spacer />
-        <Text font="caption" foregroundStyle="secondaryLabel">
-          index {heartbeatFresh}
-        </Text>
-        <Button title="首页" action={() => CustomKeyboard.dismissToHome()} />
-      </HStack>
+          <Spacer />
 
+          <Text
+            font={tune.monoTextSize}
+            foregroundStyle={hasErr ? accent : "secondaryLabel"}
+            monospacedDigit
+            offset={{ x: tune.monoOffsetX, y: tune.monoOffsetY }}
+          >
+            {rightText}
+          </Text>
+        </HStack>
+
+        {/* 模式切换 pill — SwiftUI 原生 Picker + segmented style:
+             iOS 26 自带 Liquid Glass 流动效果 (动画由系统内部处理, 不需要
+             自拼 matchedGeometry / withAnimation / Observable). Tag 直接用
+             InputMode 字面量, 与 Storage 序列化保持一致.
+             offset={{x, y}} 走 CommonViewProps (dts:4008), 让用户在 tweak
+             面板上下左右微调 pill 相对 ZStack 中心的位置. */}
+        <Picker
+          title="输入模式"
+          pickerStyle="segmented"
+          value={inputMode}
+          onChanged={(v) => onPickMode(v as InputMode)}
+          frame={{ width: tune.pillWidth }}
+          offset={{ x: tune.pillOffsetX, y: tune.pillOffsetY }}
+        >
+          <Text tag="dictation">口述</Text>
+          <Text tag="auto">自动</Text>
+          <Text tag="translation">翻译</Text>
+        </Picker>
+      </ZStack>
+
+      <Spacer />
+
+      {/* ---- 主胶囊麦克风按钮 — 精确宽/高于 Button 自身，Liquid Glass 以此渲染胶囊形状
+             注意：frame.width 是精确宽度（非 minWidth），slider 拖多少 = pt 多少；
+             若设置过窄（< 160pt 左右）可能让"结束录音"4 字被截断。 */}
       <HStack>
         <Spacer />
         <Button
-          title={micLabel}
           action={onMicTap}
           disabled={micDisabled}
-        />
+          buttonStyle="plain"
+          frame={{ width: tune.micMinWidth, height: tune.micHeight }}
+          offset={{ x: tune.micOffsetX, y: tune.micOffsetY }}
+          glassEffect={{
+            glass: UIGlass.regular().tint(accent.light).interactive(true),
+            shape: "capsule",
+          }}
+        >
+          <HStack
+            spacing={tune.micIconTextGap}
+            padding={{ horizontal: tune.micPadH }}
+          >
+            <Image
+              systemName={micSym}
+              font={tune.micIconSize}
+              foregroundStyle="white"
+            />
+            <Text
+              font={tune.micTextSize}
+              fontWeight="semibold"
+              foregroundStyle="white"
+            >
+              {micText}
+            </Text>
+          </HStack>
+        </Button>
         <Spacer />
       </HStack>
 
-      {DEBUG && openURLResult !== null ? (
-        <Text font="caption" foregroundStyle="secondaryLabel">
-          {openURLResult}
-        </Text>
-      ) : null}
-
-      {DEBUG ? (
-        <Text font="caption" foregroundStyle="secondaryLabel">
-          mode={mode} · state={state} · tick={tick}
-        </Text>
-      ) : null}
+      <Spacer />
+      {/* 底部工具栏删除：iOS 自带 🌐 切换键盘 + 🎤 关键盘/Siri，我们重复一份浪费空间 */}
     </VStack>
   )
 }
@@ -576,7 +833,18 @@ function VoiceboardKeyboard() {
 // 结论：放弃 L1 方向，由 Stage 3.5 用 L3 (轮询自挂起) 解决 ghost tree 的
 // 资源占用问题，不再触碰 present() 调用次数。
 async function main() {
-  await Promise.all([CustomKeyboard.requestHeight(260)])
+  // 初始 requestHeight 在 present() 之前打，让首帧直接是目标高度，避免
+  // 系统默认 → 我们 useEffect 改写之间的高度跳动。从 Storage 读 tune，
+  // 首次运行用 260 默认；组件内 useEffect 再按最新 storage 值持续同步。
+  try {
+    CustomKeyboard.requestHeight(readTune("kbd.height", 199))
+  } catch {}
+  try {
+    CustomKeyboard.setHasDictationKey(readTuneBool("kbd.hasDictation", true))
+  } catch {}
+  try {
+    CustomKeyboard.setToolbarVisible(readTuneBool("kbd.toolbarVisible", false))
+  } catch {}
   CustomKeyboard.present(<VoiceboardKeyboard />)
 }
 

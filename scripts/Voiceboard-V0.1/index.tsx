@@ -8,8 +8,10 @@ import {
   Script,
   ScrollView,
   SecureField,
+  Slider,
   Spacer,
   Text,
+  Toggle,
   useEffect,
   useState,
   VStack,
@@ -46,6 +48,7 @@ import {
   readFilePath,
   readFinalText,
   readHeartbeat,
+  readInputMode,
   readLog,
   readOpenAIKey,
   readPolishMs,
@@ -56,6 +59,8 @@ import {
   readSessionStartedAt,
   readSttMs,
   readState,
+  readTune,
+  readTuneBool,
   readWarmDurationMs,
   readWarmUntil,
   VBErrorKind,
@@ -75,6 +80,8 @@ import {
   writeSessionStartedAt,
   writeSttMs,
   writeState,
+  writeTune,
+  writeTuneBool,
   writeWarmDurationMs,
   writeWarmUntil,
 } from "./shared"
@@ -767,6 +774,13 @@ const POLISH_INSTRUCTIONS = `你是一个语音输入润色助手。把用户口
 - 保留用户原意，不要扩写、不要总结、不要回答问题、不要加任何解释。
 - 直接输出润色后的文本，不要前缀，不要引号。`
 
+// Stage 6a — 翻译模式 prompt。键盘 pill 选「翻译」时 worker 用这条替换
+// POLISH_INSTRUCTIONS。输入: Scribe 转出的中文。输出: 自然英文。
+const TRANSLATE_INSTRUCTIONS = `You are a speech translation assistant. The user dictated in Chinese; translate the transcript into natural, conversational English:
+- Preserve the speaker's meaning, tone, and register.
+- Fix obvious transcription errors silently.
+- Output the English translation only — no Chinese, no quotes, no commentary, no prefix.`
+
 // Defensive parser: Responses API has a few possible shapes depending on
 // model + tool usage. Try the documented `output_text` shortcut first, then
 // walk the structured `output[]` tree, then bail with a useful error.
@@ -806,9 +820,11 @@ function extractResponsesText(json: unknown): string {
 
 async function polishWithOpenAI(
   rawText: string,
-  key: string
+  key: string,
+  instructions: string,
+  debugLabel: string
 ): Promise<string> {
-  log("openai POST · raw len=", rawText.length)
+  log("openai POST ·", debugLabel, "· raw len=", rawText.length)
   const t0 = Date.now()
   // Stage 5b — 读用户配置的超时（默认 20s，预设 10/20/30/60，可配 5-120s）。
   // 超时后 fetch Promise reject，调用者（stopAndTranscribe 的 catch）会写
@@ -829,12 +845,12 @@ async function polishWithOpenAI(
     body: JSON.stringify({
       model: "gpt-5.4-mini",
       input: rawText,
-      instructions: POLISH_INSTRUCTIONS,
+      instructions,
       reasoning: { effort: "none" },
       max_output_tokens: 1024,
     }),
     timeout: timeoutSec,
-    debugLabel: "openai.polish",
+    debugLabel,
   })
   const elapsedMs = Date.now() - t0
   log("openai response", res.status, `${elapsedMs}ms`)
@@ -999,19 +1015,43 @@ async function stopAndTranscribe(): Promise<void> {
     return
   }
 
-  // 3. polish phase (optional — skipped if no OpenAI key)
+  // 3. polish / translate phase — 由 inputMode 决定走哪条路径：
+  //    dictation   → 跳过 polish，键盘 rawText fallback 直接插入原文
+  //    auto        → 现有 polish prompt（标点矫正 + 口语清洗）
+  //    translation → 同样调 OpenAI，但 prompt 换成「中译英」
   const openaiKey = readOpenAIKey()
+  const inputMode = readInputMode()
+  log("inputMode=", inputMode)
+
+  if (inputMode === "dictation") {
+    log("inputMode=dictation · skipping polish · state=done with rawText")
+    writeState("done")
+    doneStateSetAt = Date.now()
+    return
+  }
+
   if (openaiKey === null || openaiKey.length === 0) {
     log("no OpenAI key · skipping polish · state=done with rawText")
     writeState("done")
     doneStateSetAt = Date.now()
     return
   }
+
+  const isTranslate = inputMode === "translation"
+  const instructions = isTranslate ? TRANSLATE_INSTRUCTIONS : POLISH_INSTRUCTIONS
+  const debugLabel = isTranslate ? "openai.translate" : "openai.polish"
+  const errorLabel = isTranslate ? "翻译失败" : "润色失败"
+
   writeState("polishing")
   await throttledActivityUpdate({ status: "polishing" })
-  log("state=polishing")
+  log("state=polishing · mode=", inputMode)
   try {
-    const polished = await polishWithOpenAI(rawText, openaiKey)
+    const polished = await polishWithOpenAI(
+      rawText,
+      openaiKey,
+      instructions,
+      debugLabel
+    )
     writeFinalText(polished)
     writeState("done")
     doneStateSetAt = Date.now()
@@ -1027,7 +1067,7 @@ async function stopAndTranscribe(): Promise<void> {
     doneStateSetAt = Date.now()
     await throttledActivityUpdate({
       status: "error",
-      errorLabel: "润色失败",
+      errorLabel,
     })
   }
 }
@@ -1556,10 +1596,178 @@ function registerOnResumeListener(): void {
   }
 }
 
+// Stage 6a Phase C — 键盘布局调参面板配置。
+// 每项 = [存储键, 中文用户口径标签, 最小值, 最大值, 默认值]
+// 用词规则（用户友好口径，不用 padding/spacing 等行话）：
+//   空隙   = 元素与容器之间的内边距（原 padding）
+//   距离   = 两个元素之间的间距（原 spacing）
+//   移动   = 位置偏移（原 offset，+/- 表示右下/左上）
+//   宽度/高度/大小 = 尺寸直白说
+// 默认值必须与 keyboard.tsx 里 readTune(...) 的 def 对齐；
+// 新加条目时两边同步。
+const TUNE_SECTIONS: Array<{
+  title: string
+  params: Array<[string, string, number, number, number]>
+}> = [
+  {
+    title: "键盘整体",
+    params: [
+      ["kbd.height",       "键盘高度",        180, 400, 199],
+      ["outer.padH",       "左右空隙",          0,  40,  12],
+      ["outer.padTop",     "顶部空隙",          0,  40,  10],
+      ["outer.padBottom",  "底部空隙",          0,  40,  10],
+      ["outer.rowSpacing", "三行上下距离",       0,  30,  10],
+    ],
+  },
+  {
+    title: "顶行布局",
+    params: [
+      ["top.rowSpacing",     "三元素左右距离",     0, 24, 8],
+      ["top.tagMainSubGap",  "状态标签主副文字距离", 0,  8, 1],
+    ],
+  },
+  {
+    title: "状态标签（左上）",
+    params: [
+      ["tag.iconSize",     "图标大小",         8,  24, 12],
+      ["tag.textSize",     "主文字大小",       9,  20, 12],
+      ["tag.subTextSize",  "副文字大小",       8,  16, 11],
+      ["tag.innerSpacing", "图标文字距离",     0,  12,  4],
+      ["tag.offsetX",      "左右移动",       -60,  60,  9],
+      ["tag.offsetY",      "上下移动",       -20,  20,  0],
+    ],
+  },
+  {
+    title: "右上时码",
+    params: [
+      ["mono.textSize", "字体大小",    9,  20, 14],
+      ["mono.offsetX",  "左右移动",  -60,  60, -9],
+      ["mono.offsetY",  "上下移动",  -20,  20,  0],
+    ],
+  },
+  {
+    title: "模式条（口述/自动/翻译）",
+    params: [
+      ["pill.width",        "宽度",         120, 340, 178],
+      ["pill.containerPad", "外框空隙",       0,  12,   3],
+      ["pill.segSpacing",   "三段距离",       0,  10,   2],
+      ["pill.segHPad",      "段左右空隙",     4,  24,  11],
+      ["pill.segVPad",      "段上下空隙",     0,  12,   4],
+      ["pill.segTextSize",  "文字大小",       9,  20,  12],
+      ["pill.offsetX",      "左右移动",    -100, 100,   0],
+      ["pill.offsetY",      "上下移动",     -20,  20,   0],
+    ],
+  },
+  {
+    title: "主胶囊麦克风",
+    params: [
+      ["mic.minWidth",    "宽度",         140, 320, 167],
+      ["mic.height",      "高度",          40,  80,  59],
+      ["mic.padH",        "左右空隙",      10,  40,  26],
+      ["mic.iconTextGap", "图标文字距离",   4,  24,  10],
+      ["mic.iconSize",    "图标大小",      12,  40,  20],
+      ["mic.textSize",    "文字大小",      12,  24,  17],
+      ["mic.offsetX",     "左右移动",     -80,  80,   0],
+      ["mic.offsetY",     "上下移动",     -40,  40,   0],
+    ],
+  },
+]
+
+// Stage 6a Phase C — 布尔开关（Toggle）配置。独立于 TUNE_SECTIONS，因为
+// 滑杆/开关两类控件的 schema 不同（滑杆需 min/max/def，开关只需 def）。
+// 每项 = [存储键, 中文标签, 默认值]。默认值必须与 keyboard.tsx 里
+// readTuneBool(key, def) 的 def 对齐（系统 API 默认都是 true）。
+const TUNE_BOOL_SECTIONS: Array<{
+  title: string
+  params: Array<[string, string, boolean]>
+}> = [
+  {
+    title: "系统键盘层（iOS 原生）",
+    params: [
+      ["kbd.hasDictation",   "显示系统麦克风键",    true],
+      ["kbd.toolbarVisible", "显示键盘顶部工具栏",  false],
+    ],
+  },
+]
+
+// 调参面板里的一根滑杆 + 即时数值显示。value 双向绑定到 Storage 的 tune key。
+// 拖拽时本地 setState 即时 UI 响应；onChanged 同时写 Storage，键盘下一轮 poll 生效。
+function TuneSlider({
+  keyName,
+  label,
+  min,
+  max,
+  def,
+}: {
+  keyName: string
+  label: string
+  min: number
+  max: number
+  def: number
+}) {
+  const [val, setVal] = useState<number>(() => readTune(keyName, def))
+  return (
+    <VStack alignment="leading" spacing={2}>
+      <HStack spacing={8}>
+        <Text font="footnote">{label}</Text>
+        <Spacer />
+        <Text
+          font="footnote"
+          monospacedDigit
+          foregroundStyle={val === def ? "secondaryLabel" : "systemBlue"}
+        >
+          {val}
+          {val !== def ? ` · 默认 ${def}` : ""}
+        </Text>
+      </HStack>
+      <Slider
+        value={val}
+        min={min}
+        max={max}
+        step={1}
+        onChanged={(v) => {
+          const rounded = Math.round(v)
+          if (rounded === val) return
+          setVal(rounded)
+          writeTune(keyName, rounded)
+        }}
+      />
+    </VStack>
+  )
+}
+
+// Stage 6a Phase C — 布尔 tune 开关。与 TuneSlider 并列，不同点：
+// 存储是 boolean（走 readTuneBool / writeTuneBool），控件是 iOS 原生 Toggle。
+// 状态切到 true/false 立即写 Storage，键盘 useEffect 同步后调 CustomKeyboard.* 生效。
+function TuneToggle({
+  keyName,
+  label,
+  def,
+}: {
+  keyName: string
+  label: string
+  def: boolean
+}) {
+  const [val, setVal] = useState<boolean>(() => readTuneBool(keyName, def))
+  return (
+    <Toggle
+      title={label}
+      value={val}
+      onChanged={(v) => {
+        setVal(v)
+        writeTuneBool(keyName, v)
+      }}
+    />
+  )
+}
+
 function MainView() {
   const dismiss = Navigation.useDismiss()
   const [tick, setTick] = useState(0)
   const [bgActive, setBgActive] = useState<boolean | null>(null)
+  // Stage 6a — 调参面板重置计数。点「重置全部」会 +1，所有 TuneSlider
+  // 的 key 带上这个 suffix 从而强制 unmount/remount，重读 Storage 的新值。
+  const [tuneResetCounter, setTuneResetCounter] = useState(0)
   const [scribeKeyDraft, setScribeKeyDraft] = useState<string>(
     readScribeKey() ?? ""
   )
@@ -2118,6 +2326,87 @@ function MainView() {
                 setTick((t) => t + 1)
               }}
             />
+          </VStack>
+
+          {/* ---- Stage 6a · 键盘布局调参面板 ----
+               拖滑杆实时写 Storage，键盘（在其他 app 打开）≤400ms 内 re-render 生效。
+               字段按 5 大区分组；每区相互独立，不需要全量调。 */}
+          <VStack spacing={10} alignment="leading">
+            <HStack spacing={8}>
+              <Text font="caption" foregroundStyle="secondaryLabel">
+                键盘布局调参
+              </Text>
+              <Spacer />
+              <Button
+                title="重置全部"
+                action={() => {
+                  TUNE_SECTIONS.forEach((s) => {
+                    s.params.forEach(([key, , , , def]) => {
+                      writeTune(key, def)
+                    })
+                  })
+                  TUNE_BOOL_SECTIONS.forEach((s) => {
+                    s.params.forEach(([key, , def]) => {
+                      writeTuneBool(key, def)
+                    })
+                  })
+                  setTuneResetCounter((c) => c + 1)
+                  log("tune reset to defaults (sliders + toggles)")
+                }}
+              />
+            </HStack>
+            <Text font="caption2" foregroundStyle="secondaryLabel">
+              拖动 → 写 Storage → 键盘 ≤400ms 同步生效（回到有键盘的 app 即可看到）。
+              带蓝色数值 = 已偏离默认。
+            </Text>
+            {TUNE_SECTIONS.map((section) => (
+              <VStack
+                key={section.title}
+                spacing={8}
+                alignment="leading"
+              >
+                <Text
+                  font="footnote"
+                  fontWeight="semibold"
+                  foregroundStyle="secondaryLabel"
+                >
+                  · {section.title}
+                </Text>
+                {section.params.map(([keyName, label, min, max, def]) => (
+                  <TuneSlider
+                    key={`${keyName}-${tuneResetCounter}`}
+                    keyName={keyName}
+                    label={label}
+                    min={min}
+                    max={max}
+                    def={def}
+                  />
+                ))}
+              </VStack>
+            ))}
+            {TUNE_BOOL_SECTIONS.map((section) => (
+              <VStack
+                key={section.title}
+                spacing={8}
+                alignment="leading"
+              >
+                <Text
+                  font="footnote"
+                  fontWeight="semibold"
+                  foregroundStyle="secondaryLabel"
+                >
+                  · {section.title}
+                </Text>
+                {section.params.map(([keyName, label, def]) => (
+                  <TuneToggle
+                    key={`${keyName}-${tuneResetCounter}`}
+                    keyName={keyName}
+                    label={label}
+                    def={def}
+                  />
+                ))}
+              </VStack>
+            ))}
           </VStack>
 
           <VStack spacing={4} alignment="leading">
