@@ -7,6 +7,7 @@ import {
   Spacer,
   Text,
   useEffect,
+  useObservable,
   useState,
   VStack,
   ZStack,
@@ -54,6 +55,14 @@ function logErr(...args: unknown[]): void {
 const POLL_MS = 400
 const SLOW_POLL_MS = 5000 // ghost 树降频到 5s/次，省 CPU/重渲染开销
 const COLD_START_WAIT_MS = 3000
+// Stage 7 — fresh-mount 保护窗口（从 mount 起算 5s）。
+// 用途 1：poll loop shouldFast 的兜底条件 —— 新 tree 冷启后还没被用户 tap
+// 之前, activeTree 还指向旧 tree, 如果此时判 ghost 会降到 5s 慢轮询, 让录音
+// 秒数 / warm 倒计时卡住, 用户眼睛看到"死了". 5s 覆盖日志里 tap → 新 tree
+// mount → 用户首次 tap 的典型 2.5-4.5s 窗口。
+// 用途 2：sync effect 的动画通道 gate —— fresh-mount 期内允许走 setTimeout +
+// withAnimation 走 SwiftUI 动画事务, 超期则降级为纯同步 setValue。
+const FRESH_MOUNT_MS = 5000
 const DEBUG = true
 
 // Module-level identity for THIS JS evaluation of keyboard.tsx. Used by L2
@@ -198,6 +207,44 @@ function VoiceboardKeyboard() {
   // immediately switches to fast polling instead of waiting 5s.
   const [wakeRef] = useState<{ wake: () => void }>(() => ({ wake: () => {} }))
 
+  // Stage 7 — per-tree mount timestamp, 给 sync effect + poll loop 做
+  // fresh-mount 判定。iOS 冷启 VC 重建时新 tree 的 activeTree 还指向旧 tree
+  // (用户还没在新 tree 上 tap), isSelfActive=false; 但这个新 tree 正是用户
+  // 即将看到的, 必须让它走动画通道 + 保持快轮询。用 "mount 后 <
+  // FRESH_MOUNT_MS (5s)" 作为 fresh 判据, 覆盖 cold-start 2.5-4.5s 窗口 +
+  // 用户首次 tap 前的缓冲。
+  const [mountedAt] = useState(() => Date.now())
+
+  // Stage 7 — 动画镜像 Observable（cold-start first-mount animation fix）。
+  //
+  // 为什么要镜像：iOS 冷启销毁 + 重建 UIInputViewController 时，新 React tree
+  // 首帧直接读到 state="armed"，mode="recording"，micSym="stop.fill"。SwiftUI
+  // 的 contentTransition(symbolEffectReplace) + .animation(_:value:) 只在
+  // value 变化时触发，首次渲染没有"旧值"→ 没有 morph → 用户看到"圆形消失 →
+  // 停顿 → 方形突然出现"。
+  //
+  // 修法：镜像 Observable 初始化为 idle 态占位值 → React 首帧绘制 idle UI
+  // (mic.fill 圆麦, 不动画, 符合 SwiftUI 语义) → useEffect 首次执行时
+  // withAnimation 把 Observable 翻到真实目标态 → SwiftUI 动画事务中
+  // contentTransition 触发 mic.fill → stop.fill / circle → circle.fill morph。
+  //
+  // 为什么 placeholder 选 idle 而非 warm：fresh 打开键盘 (state=idle) 时
+  // placeholder=actual → 零 morph (无 warm 态 flicker)；cold-start 重建时
+  // idle→recording 的图标对恰好是"用户刚点麦克风图标"的心理预期, 比 warm
+  // →recording 更贴合用户心智模型。idle 各字段天然值: mode="idle", state=
+  // "idle", hasErr=false, rightText="idle" (见 rightLabelText 兜底)。
+  //
+  // 必须用 Observable（非 useState）：withAnimation(body) 只接 Observable
+  // .setValue 的同步 SwiftUI 写；React useState 是异步调度，会错过 SwiftUI
+  // 动画事务。依据：CLAUDE.md `feedback_scripting_subview_hooks_refresh.md`。
+  // 原生 pattern 参考：Apple WWDC23 session 10258 + Hacking with Swift
+  // "animate-immediately-after-a-view-appears"（onAppear + withAnimation 翻
+  // 占位值）。
+  const displayMode = useObservable<Mode>("idle")
+  const displayHasErr = useObservable<boolean>(false)
+  const displayRightText = useObservable<string>("idle")
+  const displayState = useObservable<VBState>("idle")
+
   // 启动时一次性从 Storage 读 inputMode（处理从 idle 冷启 / 主 app 改过的情况）
   useEffect(() => {
     setInputMode(readInputMode())
@@ -216,7 +263,9 @@ function VoiceboardKeyboard() {
   // Fast mode (POLL_MS=400ms) when ANY of:
   //   - this tree is the user-active one (activeTree===TREE_ID)
   //   - nobody has tapped yet (activeTree===null) — first-session compat
-  //   - a session is running (state !== "idle") — defensive
+  //   - fresh-mount <5s AND session running — cold-start 新 tree 还没被 tap
+  //     成 active 前的保护窗 (Stage 7 thermal fix; 原"state !== idle"全量
+  //     兜底让 20+ ghost 也跟着快轮询 → 发烫 + 动画不稳)
   // Otherwise slow mode (SLOW_POLL_MS=5000ms), 12.5× cheaper.
   //
   // Wakeup paths back to fast:
@@ -243,13 +292,34 @@ function VoiceboardKeyboard() {
       setInputMode(readInputMode())
       const stateNow = readState()
       const activeTree = readActiveTree()
-      // Stage 4.5b — warm 窗口内也必须 fast poll，否则用户看到的倒计时
-      // 会 5s 跳一次。L3 的 "stateNow !== 'idle'" 分支本身就覆盖了 warm，
-      // 这里显式列出以示意图。
+      // Stage 7 thermal fix —— 缩小 fast-poll 的触发条件, 让真正的 ghost tree
+      // 即使在 active session 期间也保持慢轮询, 降低桥接调用密度。
+      //
+      // 历史: Stage 4.5b 为了 warm 倒计时每秒跳一次而加的 `stateNow !== "idle"`
+      // 兜底条件, 让所有 ghost tree 在 active session 全程 400ms 快轮询。单棵
+      // tree 时代价可忽略; 但 iOS 不销毁旧 React tree, 多次 session + 锁屏后
+      // ghost 累积到 15-20 棵, 全部一起 400ms 快轮询 + Stage 7 sync effect 每
+      // tick 跨桥接 5 次 → ~250 Hz 桥接 → 手机发烫 + active tree 动画不稳。
+      //
+      // 修法: 把 "stateNow !== idle" 兜底, 收敛到 "fresh-mount 且 state 非
+      // idle" 。fresh-mount (<5s) 覆盖 cold-start 新 tree 还未被用户 tap 的
+      // 窗口 (日志里 tap → 新 tree mount 典型 2.5-4.5s, 用户首次停录 tap 再
+      // 加 1-5s), 保证新 tree 该快的时候快; 超过 5s 仍没被 tap 成 active 的
+      // tree 视为真 ghost, 慢轮询。后续 user tap 可通过 wakeRef.wake() 立刻
+      // 升频, 不会卡。
+      //
+      // 常见场景验证:
+      //  - 首次冷启新 tree: isFreshMount=true, 快轮询, 动画+倒计时流畅
+      //  - warm 复用 tap: tap 时 writeActiveTree → activeTree===TREE_ID 分支
+      //    命中, 快轮询
+      //  - 老 ghost: isFreshMount=false + activeTree !== TREE_ID, 慢轮询
+      //  - clearActiveTree 后 (index 启动 / reset): activeTree===null 分支命中
+      //    所有 tree 快轮询, 与原 "first-session compat" 等价
+      const isFreshMount = Date.now() - mountedAt < FRESH_MOUNT_MS
       const shouldFast =
         activeTree === null ||
         activeTree === TREE_ID ||
-        stateNow !== "idle"
+        (isFreshMount && stateNow !== "idle")
       if (shouldFast && inSlowMode) {
         log(
           "poll resumed: fast (activeTree=",
@@ -576,13 +646,12 @@ function VoiceboardKeyboard() {
     }
   }
 
-  // Stage 6a — 派生渲染态。所有 UI 文案/色/图标都经 helper 函数统一 derive，
-  // 便于同步修改 / 避免散落在 JSX 里的条件分支。
+  // Stage 6a — 派生渲染态。Stage 7 起 UI 文案/色/图标从 display Observable
+  // (dAccent / dTagText / dMicSym / dMicText) 派生; 这里只保留 sync effect
+  // 需要的 source-of-truth 派生值 (hasErr / rightText) 做依赖比对。
   const hasErr = err !== null
-  const accent = accentFor(mode, hasErr)
   const recordingElapsedSec =
     sessionStartedAt !== null ? (now - sessionStartedAt) / 1000 : 0
-  const tagText = statusTagText(mode, hasErr)
   const rightText = rightLabelText(
     mode,
     state,
@@ -591,14 +660,96 @@ function VoiceboardKeyboard() {
     hasErr,
     errKind
   )
-  const micSym = micSymbolFor(mode, state, hasErr)
-  const micText = micCapsuleLabel(mode, state, hasErr)
   const errShort =
     hasErr && err !== null
       ? err.length > 28
         ? err.slice(0, 28) + "…"
         : err
       : null
+
+  // Stage 7 cold-start animation fix —— new tree 首帧绘出 idle 占位态后,
+  // useEffect 首 tick 里 withAnimation 把 4 个 display Observable 翻到真实
+  // 目标态, 强制 SwiftUI 进入动画事务 → contentTransition(symbolEffectReplace)
+  // / numericText 正常 morph。
+  //
+  // 常态 (warm 同 tree re-render) 也走这条路径: Observable 值 != 派生值 →
+  // withAnimation setValue → 动画触发。与 JSX 里 animation={{value}} 叠加
+  // (双保险)。
+  //
+  // 依赖 Array 包含 mode/hasErr/rightText/state —— 任一变都触发 effect。
+  // rightText 每 400ms tick 因 recordingElapsedSec/warmRemainingSec 变化
+  // 而更新 → 数字位持续 numericText morph。
+  //
+  // setValue 后 bump tick 一次, 触发 React 立即 re-render → JSX 重读 obs
+  // .value 把新 string 灌进 animation={{value}} → SwiftUI 立刻感知 value
+  // 变化并执行 contentTransition(不用等下一轮 400ms poll)。
+  //
+  // Race-condition fix #1 (2026-04-22 两次冷启一好一坏)—— setTimeout(0)
+  // 推迟到下一 macrotask, 让 Render 1 在独立 runloop tick 里 commit, 给
+  // SwiftUI 建立 baseline value, Render 2 才作为真正 value 变化触发
+  // contentTransition。没这层 defer 时 Scripting 桥接偶尔把两次 commit
+  // 合并 → SwiftUI 错失 baseline → 首次 mount morph 失败。
+  //
+  // Race-condition fix #2 (2026-04-22 第二轮 4 次测试, 前 2 好, 锁屏 30s 回
+  // 来 3&4 连坏)—— L3-aware ghost tree gating。iOS 不销毁旧 React tree,多
+  // 次 session + 锁屏累积到 20+ ghost。state 变化时所有 tree 的 sync effect
+  // 同时触发 → 20+ 并发 setTimeout + withAnimation + Observable.setValue×4
+  // → SwiftUI 桥接/CPU 争用 → active tree 的 Render 1→2 commit 窗口被压缩
+  // 到 SwiftUI 区分不出 → 回退到"无 baseline"分支, morph 失败。修法:
+  // ghost tree (非 self-active 且 mount 超过 FRESH_MOUNT_MS) 只做同步 setValue
+  // 保持状态一致, **完全跳过** setTimeout + withAnimation 通道, 留给 active
+  // 或 fresh-mount tree 单独占用 SwiftUI 动画桥接。fresh-mount 5s 窗口是冷启
+  // VC 重建 + 用户首次 tap 的典型时间界 (详见 FRESH_MOUNT_MS 定义处注释)。
+  useEffect(() => {
+    const activeTree = readActiveTree()
+    const isSelfActive = activeTree === null || activeTree === TREE_ID
+    const isFreshMount = Date.now() - mountedAt < FRESH_MOUNT_MS
+    if (!isSelfActive && !isFreshMount) {
+      // Ghost tree —— 同步写入 Observable (保持状态一致) 但不走 SwiftUI
+      // 动画通道, 避免与 active tree 争用 SwiftUI 桥接。
+      if (displayMode.value !== mode) displayMode.setValue(mode)
+      if (displayHasErr.value !== hasErr) displayHasErr.setValue(hasErr)
+      if (displayRightText.value !== rightText)
+        displayRightText.setValue(rightText)
+      if (displayState.value !== state) displayState.setValue(state)
+      return
+    }
+    // Active 或 fresh-mount tree —— 走完整动画通道。
+    const handle = setTimeout(() => {
+      let changed = false
+      withAnimation(Animation.default(), () => {
+        if (displayMode.value !== mode) {
+          displayMode.setValue(mode)
+          changed = true
+        }
+        if (displayHasErr.value !== hasErr) {
+          displayHasErr.setValue(hasErr)
+          changed = true
+        }
+        if (displayRightText.value !== rightText) {
+          displayRightText.setValue(rightText)
+          changed = true
+        }
+        if (displayState.value !== state) {
+          displayState.setValue(state)
+          changed = true
+        }
+      })
+      if (changed) setTick((v) => v + 1)
+    }, 0)
+    return () => clearTimeout(handle)
+  }, [mode, hasErr, rightText, state])
+
+  // Stage 7 — 动画相关渲染值全从 display Observable 派生, 与 JSX animation
+  // 事务对齐; 非动画相关 (errShort 文本) 仍直接用 err 字段。
+  const dMode = displayMode.value
+  const dHasErr = displayHasErr.value
+  const dState = displayState.value
+  const dRightText = displayRightText.value
+  const dAccent = accentFor(dMode, dHasErr)
+  const dTagText = statusTagText(dMode, dHasErr)
+  const dMicSym = micSymbolFor(dMode, dState, dHasErr)
+  const dMicText = micCapsuleLabel(dMode, dState, dHasErr)
 
   // 模式 pill tap handler：UI 即刻反馈 + 持久化写 Storage。同值 noop。
   // 动画由原生 segmented Picker 内部处理, 我们只管状态 + 副作用.
@@ -714,41 +865,41 @@ function VoiceboardKeyboard() {
             <HStack spacing={tune.tagInnerSpacing}>
               <Image
                 systemName={
-                  hasErr
+                  dHasErr
                     ? "exclamationmark.triangle.fill"
-                    : mode === "warm"
+                    : dMode === "warm"
                       ? "waveform.badge.mic"
-                      : mode === "recording"
+                      : dMode === "recording"
                         ? "circle.fill"
-                        : mode === "processing"
+                        : dMode === "processing"
                           ? "arrow.triangle.2.circlepath"
-                          : mode === "done"
+                          : dMode === "done"
                             ? "checkmark.circle.fill"
                             : "circle"
                 }
                 font={tune.tagIconSize}
-                foregroundStyle={accent}
+                foregroundStyle={dAccent}
                 contentTransition="symbolEffectReplace"
                 symbolEffect={
-                  mode === "processing"
-                    ? { effect: "rotate", value: state }
+                  dMode === "processing"
+                    ? { effect: "rotate", value: dState }
                     : undefined
                 }
                 animation={{
                   animation: Animation.default(),
-                  value: `${mode}:${hasErr ? 1 : 0}`,
+                  value: `${dMode}:${dHasErr ? 1 : 0}`,
                 }}
               />
               <Text
                 font={tune.tagTextSize}
                 fontWeight="semibold"
-                foregroundStyle={accent}
+                foregroundStyle={dAccent}
               >
-                {tagText}
+                {dTagText}
               </Text>
             </HStack>
             {errShort !== null ? (
-              <Text font={tune.tagSubTextSize} foregroundStyle={accent}>
+              <Text font={tune.tagSubTextSize} foregroundStyle={dAccent}>
                 {errShort}
               </Text>
             ) : null}
@@ -758,16 +909,16 @@ function VoiceboardKeyboard() {
 
           <Text
             font={tune.monoTextSize}
-            foregroundStyle={hasErr ? accent : "secondaryLabel"}
+            foregroundStyle={dHasErr ? dAccent : "secondaryLabel"}
             monospacedDigit
             offset={{ x: tune.monoOffsetX, y: tune.monoOffsetY }}
             contentTransition="numericText"
             animation={{
               animation: Animation.default(),
-              value: rightText,
+              value: dRightText,
             }}
           >
-            {rightText}
+            {dRightText}
           </Text>
         </HStack>
 
@@ -805,7 +956,7 @@ function VoiceboardKeyboard() {
           frame={{ width: tune.micMinWidth, height: tune.micHeight }}
           offset={{ x: tune.micOffsetX, y: tune.micOffsetY }}
           glassEffect={{
-            glass: UIGlass.regular().tint(accent.light).interactive(true),
+            glass: UIGlass.regular().tint(dAccent.light).interactive(true),
             shape: "capsule",
           }}
         >
@@ -814,18 +965,18 @@ function VoiceboardKeyboard() {
             padding={{ horizontal: tune.micPadH }}
           >
             <Image
-              systemName={micSym}
+              systemName={dMicSym}
               font={tune.micIconSize}
               foregroundStyle="white"
               contentTransition="symbolEffectReplace"
               symbolEffect={
-                mode === "processing"
-                  ? { effect: "rotate", value: state }
+                dMode === "processing"
+                  ? { effect: "rotate", value: dState }
                   : undefined
               }
               animation={{
                 animation: Animation.default(),
-                value: `${mode}:${hasErr ? 1 : 0}`,
+                value: `${dMode}:${dHasErr ? 1 : 0}`,
               }}
             />
             <Text
@@ -833,16 +984,16 @@ function VoiceboardKeyboard() {
               fontWeight="semibold"
               foregroundStyle="white"
             >
-              {micText}
+              {dMicText}
             </Text>
-            {mode === "processing" ? (
+            {dMode === "processing" ? (
               <Image
                 systemName="ellipsis"
                 font={tune.micTextSize}
                 foregroundStyle="white"
                 symbolEffect={{
                   effect: "variableColorCumulative",
-                  value: state,
+                  value: tick,
                 }}
               />
             ) : null}
