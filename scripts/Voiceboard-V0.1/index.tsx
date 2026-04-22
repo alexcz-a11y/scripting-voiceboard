@@ -1671,6 +1671,53 @@ const TUNE_SECTIONS: Array<{
       ["mic.offsetY",     "上下移动",     -40,  40,   0],
     ],
   },
+  // ---------- Stage 6b v4 · 灵动岛（Dynamic Island）4 节 ----------
+  //
+  // v4 不对称布局：Compact 仅 leading · Expanded 小方 Leading + 大横 Trailing
+  // 围绕 TrueDepth pill · 同心 cornerRadius 32 · Voiceboard 品牌字在 Leading 上方
+  //
+  // 视觉参数热调，键名前缀 `di.*`，`live_activity.tsx` builder 每次 iOS 请求
+  // update 时重读 Storage → 改参数 ≤1s（受 LA 1000ms 节流）生效。
+  // LockScreenContent 留给 Step 3，本节不暴露其参数。
+  {
+    title: "灵动岛 · 紧凑态 + 最小",
+    params: [
+      ["di.cl.iconSize",   "紧凑左 图标大小",      10, 22, 14],
+      ["di.cl.textSize",   "紧凑左 时码大小",      10, 18, 12],
+      ["di.cl.innerGap",   "紧凑左 图标文字距离",   0, 12,  4],
+      ["di.cl.padH",       "紧凑左 左右空隙",       0, 20,  6],
+      ["di.cl.padV",       "紧凑左 上下空隙",       0, 16,  2],
+      ["di.min.iconSize",  "最小态 图标大小",      10, 24, 16],
+    ],
+  },
+  {
+    title: "灵动岛 · 展开 Leading（小方卡）",
+    params: [
+      ["di.el.leftPad",    "卡片 左边缘距外壳",     4,  32,  12],
+      ["di.el.width",      "卡片 宽度",            60, 160, 121],
+      ["di.el.iconSize",   "图标 大小",            14,  80,  56],
+    ],
+  },
+  {
+    title: "灵动岛 · 展开 Trailing（大横卡）",
+    params: [
+      ["di.et.rightPad",     "卡片 右边缘距外壳",   4, 32, 12],
+      ["di.et.headlineSize", "主文字 大小",        12, 24, 17],
+      ["di.et.captionSize",  "副文字 大小",         9, 18, 12],
+      ["di.et.rowSpacing",   "主副文字 距离",       0, 10,  3],
+    ],
+  },
+  {
+    title: "灵动岛 · 展开通用 + Voiceboard 品牌字",
+    params: [
+      ["di.ex.cardGap",      "Leading↔Trailing 间距", 0, 24,  8],
+      ["di.ex.topPad",       "卡片顶 距 pill 下缘",  47, 72, 55],
+      ["di.ex.bottomPad",    "卡片底 距外壳",         4, 24, 12],
+      ["di.ex.cardRadius",   "卡片 圆角",            16, 44, 32],
+      ["di.ex.cardPad",      "卡片 内 padding",       6, 20, 12],
+      ["di.brand.textSize",  "Voiceboard 字号",       8, 18, 11],
+    ],
+  },
 ]
 
 // Stage 6a Phase C — 布尔开关（Toggle）配置。独立于 TUNE_SECTIONS，因为
@@ -1686,6 +1733,16 @@ const TUNE_BOOL_SECTIONS: Array<{
     params: [
       ["kbd.hasDictation",   "显示系统麦克风键",    true],
       ["kbd.toolbarVisible", "显示键盘顶部工具栏",  false],
+    ],
+  },
+  // ---------- Stage 6b v4 · 灵动岛 · 显隐开关 ----------
+  // brandVisible: Leading 上方 "VOICEBOARD" 品牌字 显隐
+  // cardsVisible: Leading + Trailing 卡片半透白背景 显隐（关掉 = 裸内容无卡片框）
+  {
+    title: "灵动岛 · 显隐开关",
+    params: [
+      ["di.brand.visible",  "显示 Voiceboard 品牌字",         true],
+      ["di.cards.visible",  "显示 Leading/Trailing 卡片背景",  true],
     ],
   },
 ]
