@@ -2234,6 +2234,31 @@ function MainView() {
   }
 
   function LogView() {
+    // Stage 7 bugfix — LogView 独立刷新。NavigationLink 的 destination
+    // 一旦 push 就和 MainView 闭包脱钩：MainView 的 setTick 不会触发已
+    // mount 的 LogView 重渲染。必须自己 useState + setTimeout 轮询，
+    // 并在 render body 直接调 readLog() 拿最新值。否则"清空"虽然清了
+    // Storage，UI 还停在 mount 时的快照。
+    const [viewTick, setViewTick] = useState(0)
+    useEffect(() => {
+      let cancelled = false
+      const poll = () => {
+        if (cancelled) return
+        setViewTick((v) => v + 1)
+        setTimeout(poll, 800)
+      }
+      const h = setTimeout(poll, 800)
+      return () => {
+        cancelled = true
+        clearTimeout(h)
+      }
+    }, [])
+    void viewTick
+
+    const entries = readLog()
+    const recent = entries.slice(-200)
+    const recentText = formatLog(recent)
+
     return (
       <List listStyle="insetGrouped" navigationTitle="日志">
         <Section>
@@ -2242,7 +2267,6 @@ function MainView() {
               const all = formatLog(readLog())
               await Pasteboard.setString(all)
               log("log copied to pasteboard ·", all.length, "chars")
-              setTick((v) => v + 1)
             }}
           >
             <Label title="复制全部" systemImage="doc.on.doc" />
@@ -2251,15 +2275,15 @@ function MainView() {
             role="destructive"
             action={() => {
               clearLog()
-              setTick((v) => v + 1)
+              setViewTick((v) => v + 1)
             }}
           >
             <Label title="清空" systemImage="trash" />
           </Button>
         </Section>
-        <Section title={`最近 ${logEntries.length} 条`}>
+        <Section title={`最近 ${entries.length} 条`}>
           <Text font="footnote">
-            {recentLogText.length > 0 ? recentLogText : "(空)"}
+            {recentText.length > 0 ? recentText : "(空)"}
           </Text>
         </Section>
       </List>

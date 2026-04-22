@@ -388,6 +388,11 @@ export async function buildWarmKeeperPath(): Promise<string> {
 export type LogEntry = { ts: number; src: string; msg: string }
 
 const LOG_MAX = 500
+// Stage 7 bugfix — 日志 byte-size 自动清理上限。条目数 LOG_MAX 是主 cap，
+// 这个 byte cap 是防极端场景：某次 debug 把超长 payload dump 进日志、或
+// 长时间跑累积量大。正常运行 500 条 × ~200B ≈ 100KB，远远用不到 3MB。
+// 超限时按时间顺序丢一半，保留最新。用 JSON.stringify.length * 2 估 UTF-16 字节。
+const LOG_MAX_BYTES = 3 * 1024 * 1024
 
 function formatArgs(args: unknown[]): string {
   return args
@@ -408,6 +413,20 @@ function appendLogEntry(src: string, msg: string): void {
     const existing = (Storage.get<LogEntry[]>(K_LOG, opts) ?? []) as LogEntry[]
     existing.push({ ts: Date.now(), src, msg })
     while (existing.length > LOG_MAX) existing.shift()
+
+    let estBytes = JSON.stringify(existing).length * 2
+    if (estBytes > LOG_MAX_BYTES) {
+      while (estBytes > LOG_MAX_BYTES && existing.length > 1) {
+        existing.splice(0, Math.ceil(existing.length / 2))
+        estBytes = JSON.stringify(existing).length * 2
+      }
+      existing.push({
+        ts: Date.now(),
+        src: "shared",
+        msg: `log auto-truncated over 3MB cap · kept ${existing.length - 1} entries`,
+      })
+    }
+
     Storage.set(K_LOG, existing, opts)
   } catch {
     // best-effort
