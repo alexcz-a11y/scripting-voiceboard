@@ -1817,6 +1817,506 @@ function TuneToggle({
   )
 }
 
+// ---------------------------------------------------------------------------
+// Stage 7 post-ship · 高级选项 6 个子页（top-level FunctionComponent）
+//
+// 根据 Scripting 官方示例（reference/llms-full.md 行 86973、89161+），
+// NavigationLink destination 引用的组件应是 top-level FunctionComponent。
+// Nested function 里的 useState / useEffect 在 Scripting reconciler 下不稳定
+// 触发重渲染 —— 真机验证"日志清空点击无反应"就是这个 bug 的表现。
+// TuneSlider / TuneToggle（行 1744 / 1798）已验证 top-level 位置的 hooks 工作正常。
+// 本批把原 MainView 内的 6 个 nested subview 提到 top-level。
+// ---------------------------------------------------------------------------
+
+function fmtSec(ms: number): string {
+  return (ms / 1000).toFixed(2) + "s"
+}
+
+function PolishTimeoutView() {
+  const [picked, setPicked] = useState<number>(() => readPolishTimeoutSec())
+  return (
+    <List listStyle="insetGrouped" navigationTitle="润色超时">
+      <Section
+        header={
+          <Text font="caption" foregroundStyle="secondaryLabel">
+            当前 {picked}s
+          </Text>
+        }
+        footer={
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            网速慢 / 海外 / 蜂窝网络建议 30s+；超时后会降级插入未润色原文。
+          </Text>
+        }
+      >
+        <Picker
+          title="polish timeout"
+          pickerStyle="segmented"
+          value={picked}
+          onChanged={(v) => {
+            writePolishTimeoutSec(v as number)
+            setPicked(v as number)
+          }}
+        >
+          <Text tag={10}>10s</Text>
+          <Text tag={20}>20s</Text>
+          <Text tag={30}>30s</Text>
+          <Text tag={60}>60s</Text>
+        </Picker>
+      </Section>
+    </List>
+  )
+}
+
+function KeyboardTuneView() {
+  const [localResetCounter, setLocalResetCounter] = useState(0)
+  const KBD_TITLES = new Set([
+    "键盘整体",
+    "顶行布局",
+    "状态标签（左上）",
+    "右上时码",
+    "模式条（口述/自动/翻译）",
+    "主胶囊麦克风",
+  ])
+  const kbdSections = TUNE_SECTIONS.filter((s) => KBD_TITLES.has(s.title))
+  const kbdBoolSections = TUNE_BOOL_SECTIONS.filter(
+    (s) => s.title === "系统键盘层（iOS 原生）"
+  )
+  return (
+    <List listStyle="insetGrouped" navigationTitle="键盘调参">
+      <Section
+        footer={
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            拖动 → 写 Storage → 键盘 ≤400ms 同步生效。带蓝色数值 = 已偏离默认。
+          </Text>
+        }
+      >
+        <Button
+          role="destructive"
+          action={() => {
+            kbdSections.forEach((s) =>
+              s.params.forEach(([key, , , , def]) => writeTune(key, def))
+            )
+            kbdBoolSections.forEach((s) =>
+              s.params.forEach(([key, , def]) => writeTuneBool(key, def))
+            )
+            setLocalResetCounter((c) => c + 1)
+            vblog("index", "keyboard tune reset to defaults")
+          }}
+        >
+          <Label
+            title="重置键盘默认值"
+            systemImage="arrow.counterclockwise"
+          />
+        </Button>
+      </Section>
+      {kbdSections.map((section) => (
+        <Section key={section.title} title={section.title}>
+          {section.params.map(([keyName, label, min, max, def]) => (
+            <TuneSlider
+              key={`${keyName}-${localResetCounter}`}
+              keyName={keyName}
+              label={label}
+              min={min}
+              max={max}
+              def={def}
+            />
+          ))}
+        </Section>
+      ))}
+      {kbdBoolSections.map((section) => (
+        <Section key={section.title} title={section.title}>
+          {section.params.map(([keyName, label, def]) => (
+            <TuneToggle
+              key={`${keyName}-${localResetCounter}`}
+              keyName={keyName}
+              label={label}
+              def={def}
+            />
+          ))}
+        </Section>
+      ))}
+    </List>
+  )
+}
+
+function DynamicIslandTuneView() {
+  const [localResetCounter, setLocalResetCounter] = useState(0)
+  const DI_TITLES = new Set([
+    "灵动岛 · 紧凑态 + 最小",
+    "灵动岛 · 展开左（VOICEBOARD + 图标）",
+    "灵动岛 · 展开右（主文案 · 首字左对齐）",
+  ])
+  const diSections = TUNE_SECTIONS.filter((s) => DI_TITLES.has(s.title))
+  const diBoolSections = TUNE_BOOL_SECTIONS.filter(
+    (s) => s.title === "灵动岛 · 显隐开关"
+  )
+  return (
+    <List listStyle="insetGrouped" navigationTitle="灵动岛调参">
+      <Section
+        footer={
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            拖动 → 写 Storage → Live Activity ≤1s 同步生效。
+          </Text>
+        }
+      >
+        <Button
+          role="destructive"
+          action={() => {
+            diSections.forEach((s) =>
+              s.params.forEach(([key, , , , def]) => writeTune(key, def))
+            )
+            diBoolSections.forEach((s) =>
+              s.params.forEach(([key, , def]) => writeTuneBool(key, def))
+            )
+            setLocalResetCounter((c) => c + 1)
+            vblog("index", "dynamic island tune reset to defaults")
+          }}
+        >
+          <Label
+            title="重置灵动岛默认值"
+            systemImage="arrow.counterclockwise"
+          />
+        </Button>
+      </Section>
+      {diSections.map((section) => (
+        <Section key={section.title} title={section.title}>
+          {section.params.map(([keyName, label, min, max, def]) => (
+            <TuneSlider
+              key={`${keyName}-${localResetCounter}`}
+              keyName={keyName}
+              label={label}
+              min={min}
+              max={max}
+              def={def}
+            />
+          ))}
+        </Section>
+      ))}
+      {diBoolSections.map((section) => (
+        <Section key={section.title} title={section.title}>
+          {section.params.map(([keyName, label, def]) => (
+            <TuneToggle
+              key={`${keyName}-${localResetCounter}`}
+              keyName={keyName}
+              label={label}
+              def={def}
+            />
+          ))}
+        </Section>
+      ))}
+    </List>
+  )
+}
+
+function LogView() {
+  const [viewTick, setViewTick] = useState(0)
+  useEffect(() => {
+    let cancelled = false
+    const poll = () => {
+      if (cancelled) return
+      setViewTick((v) => v + 1)
+      setTimeout(poll, 800)
+    }
+    const h = setTimeout(poll, 800)
+    return () => {
+      cancelled = true
+      clearTimeout(h)
+    }
+  }, [])
+  void viewTick
+
+  const entries = readLog()
+  const recent = entries.slice(-200)
+  const recentText = formatLog(recent)
+
+  return (
+    <List listStyle="insetGrouped" navigationTitle="日志">
+      <Section>
+        <Button
+          action={async () => {
+            const all = formatLog(readLog())
+            await Pasteboard.setString(all)
+            vblog("index", "log copied to pasteboard ·", all.length, "chars")
+          }}
+        >
+          <Label title="复制全部" systemImage="doc.on.doc" />
+        </Button>
+        <Button
+          role="destructive"
+          action={() => {
+            clearLog()
+            setViewTick((v) => v + 1)
+          }}
+        >
+          <Label title="清空" systemImage="trash" />
+        </Button>
+      </Section>
+      <Section title={`最近 ${entries.length} 条`}>
+        <Text font="footnote">
+          {recentText.length > 0 ? recentText : "(空)"}
+        </Text>
+      </Section>
+    </List>
+  )
+}
+
+function DebugInfoView() {
+  const [viewTick, setViewTick] = useState(0)
+  const [localBgActive, setLocalBgActive] = useState<boolean | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    const poll = () => {
+      if (cancelled) return
+      setViewTick((v) => v + 1)
+      BackgroundKeeper.isActive
+        .then((a) => {
+          if (!cancelled) setLocalBgActive(a)
+        })
+        .catch(() => {})
+      setTimeout(poll, 800)
+    }
+    const h = setTimeout(poll, 800)
+    BackgroundKeeper.isActive
+      .then((a) => {
+        if (!cancelled) setLocalBgActive(a)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+      clearTimeout(h)
+    }
+  }, [])
+  void viewTick
+
+  const sttMsNow = readSttMs()
+  const polishMsNow = readPolishMs()
+  const latencyNow = (() => {
+    if (sttMsNow === null && polishMsNow === null) return null
+    const parts: string[] = []
+    if (sttMsNow !== null) parts.push(`STT ${fmtSec(sttMsNow)}`)
+    if (polishMsNow !== null) parts.push(`polish ${fmtSec(polishMsNow)}`)
+    if (sttMsNow !== null && polishMsNow !== null) {
+      parts.push(`合计 ${fmtSec(sttMsNow + polishMsNow)}`)
+    }
+    return parts.join(" · ")
+  })()
+  const heartbeatNow = readHeartbeat()
+  const heartbeatAgoNow =
+    heartbeatNow !== null
+      ? ((Date.now() - heartbeatNow) / 1000).toFixed(1)
+      : "—"
+  const qpNow = JSON.stringify(Script.queryParameters ?? {})
+
+  return (
+    <List listStyle="insetGrouped" navigationTitle="调试信息">
+      {latencyNow !== null ? (
+        <Section title="链路耗时">
+          <Text font="footnote" foregroundStyle="systemBlue">
+            {latencyNow}
+          </Text>
+        </Section>
+      ) : null}
+      <Section title="运行时">
+        <HStack>
+          <Text font="footnote">BackgroundKeeper.isActive</Text>
+          <Spacer />
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            {localBgActive === null ? "…" : String(localBgActive)}
+          </Text>
+        </HStack>
+        <HStack>
+          <Text font="footnote">sessionActive</Text>
+          <Spacer />
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            {String(sessionActive)}
+          </Text>
+        </HStack>
+        <HStack>
+          <Text font="footnote">recorder</Text>
+          <Spacer />
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            {recorder !== null ? "running" : "—"}
+          </Text>
+        </HStack>
+        <HStack>
+          <Text font="footnote">silentKeeper</Text>
+          <Spacer />
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            {silentKeeper !== null ? "running" : "—"}
+          </Text>
+        </HStack>
+        <HStack>
+          <Text font="footnote">heartbeat</Text>
+          <Spacer />
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            {heartbeatAgoNow}s ago
+          </Text>
+        </HStack>
+        <HStack>
+          <Text font="footnote">Script.name</Text>
+          <Spacer />
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            {Script.name}
+          </Text>
+        </HStack>
+        <HStack>
+          <Text font="footnote">lastRecorderError</Text>
+          <Spacer />
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            {lastRecorderError ?? "—"}
+          </Text>
+        </HStack>
+      </Section>
+      <Section title="queryParameters">
+        <Text font="footnote" foregroundStyle="secondaryLabel">
+          {qpNow}
+        </Text>
+      </Section>
+    </List>
+  )
+}
+
+function ExperimentsView() {
+  const [viewTick, setViewTick] = useState(0)
+  useEffect(() => {
+    let cancelled = false
+    const poll = () => {
+      if (cancelled) return
+      setViewTick((v) => v + 1)
+      setTimeout(poll, 1000)
+    }
+    const h = setTimeout(poll, 1000)
+    return () => {
+      cancelled = true
+      clearTimeout(h)
+    }
+  }, [])
+  void viewTick
+
+  const labelFor = (id: ExperimentId): string =>
+    id === "A1"
+      ? "A1 · 裸 keepAlive"
+      : id === "A2"
+      ? "A2 · keepAlive + Live Activity"
+      : id === "A3"
+      ? "A3 · keepAlive + 静音录音"
+      : "A4 · keepAlive + LA + 静音录音"
+  const iconFor = (id: ExperimentId): string =>
+    id === "A1"
+      ? "1.circle"
+      : id === "A2"
+      ? "2.circle"
+      : id === "A3"
+      ? "3.circle"
+      : "4.circle"
+  return (
+    <List listStyle="insetGrouped" navigationTitle="保活机制实测">
+      <Section
+        header={
+          <Text font="caption" foregroundStyle="secondaryLabel">
+            历史结果
+          </Text>
+        }
+        footer={
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            4.5a 实验（不影响正常录音链路）。运行前请确保主流程不在 warm/armed 态。
+          </Text>
+        }
+      >
+        {(["A1", "A2", "A3", "A4"] as ExperimentId[]).map((id) => {
+          const r = expResults[id]
+          const result =
+            r === undefined
+              ? "—"
+              : r.firstHeartbeatAt === 0
+              ? `error at ${((r.endedAt - r.startedAt) / 1000).toFixed(1)}s`
+              : `存活 ${(
+                  (r.lastHeartbeatAt - r.firstHeartbeatAt) /
+                  1000
+                ).toFixed(1)}s · ${r.cause}`
+          return (
+            <HStack key={`result-${id}`}>
+              <Text font="footnote">{labelFor(id)}</Text>
+              <Spacer />
+              <Text
+                font="footnote"
+                foregroundStyle={
+                  r === undefined ? "secondaryLabel" : "systemBlue"
+                }
+              >
+                {result}
+              </Text>
+            </HStack>
+          )
+        })}
+      </Section>
+      {expRunning !== null ? (
+        <Section title="运行中">
+          <HStack>
+            <Image systemName="hourglass" foregroundStyle="orange" />
+            <Text font="footnote" foregroundStyle="orange">
+              {expRunning} · 剩余{" "}
+              {Math.max(0, Math.floor((expEndAt - Date.now()) / 1000))}
+              s
+            </Text>
+            <Spacer />
+          </HStack>
+          <Button
+            role="destructive"
+            action={async () => {
+              await cancelExperiment()
+              setViewTick((t) => t + 1)
+            }}
+          >
+            <Label title="提前结束" systemImage="stop.circle" />
+          </Button>
+        </Section>
+      ) : null}
+      <Section title="运行实验">
+        {(["A1", "A2", "A3", "A4"] as ExperimentId[]).map((id) => (
+          <Button
+            key={`run-${id}`}
+            action={() => {
+              if (expRunning !== null || sessionActive) {
+                vblog("index", `${id} tap ignored · busy`)
+                return
+              }
+              runExperiment(id)
+              setViewTick((t) => t + 1)
+            }}
+          >
+            <Label title={labelFor(id)} systemImage={iconFor(id)} />
+          </Button>
+        ))}
+      </Section>
+      <Section
+        header={
+          <Text font="caption" foregroundStyle="secondaryLabel">
+            onResume 路径
+          </Text>
+        }
+        footer={
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            点拷贝 URL，切到备忘录粘贴并点击链接，应看到日志新增 "onResume fired" 且没有 "script run · env="。
+          </Text>
+        }
+      >
+        <Button
+          action={async () => {
+            const url = `scripting://run/${encodeURIComponent(
+              Script.name
+            )}?probe=1`
+            await Pasteboard.setString(url)
+            vblog("index", "onResume probe URL copied:", url)
+          }}
+        >
+          <Label title="拷贝 probe URL" systemImage="link" />
+        </Button>
+      </Section>
+    </List>
+  )
+}
+
 function MainView() {
   const dismiss = Navigation.useDismiss()
   const [tick, setTick] = useState(0)
@@ -2036,7 +2536,7 @@ function MainView() {
   const scribeKeySet = (readScribeKey() ?? "").length > 0
   const openAIKeySet = (readOpenAIKey() ?? "").length > 0
 
-  const fmtSec = (ms: number): string => (ms / 1000).toFixed(2) + "s"
+  // Stage 7 post-ship — fmtSec 已提到 module-level（top-level 子页也用）
   const latencyLine = (() => {
     if (sttMs === null && polishMs === null) return null
     const parts: string[] = []
@@ -2048,514 +2548,9 @@ function MainView() {
     return parts.join(" · ")
   })()
 
-  // Stage 7 R3 — AdvancedView 精简为"入口列表 + 6 孙子页"。
-  // 每个孙子页惰性挂载（NavigationLink destination），只在用户 push 进去时 mount。
-  // 所有孙子页都是 nested function，闭包共享 MainView 的 state / 派生值 / 模块级业务函数。
-
-  function PolishTimeoutView() {
-    // Stage 7 post-ship — 本地 state 下沉。Picker 的 value 和 onChanged 都
-    // 在本子页内消化；写 Storage 让 worker 的下一次 polish fetch 能读到新值。
-    const [picked, setPicked] = useState<number>(() => readPolishTimeoutSec())
-    return (
-      <List listStyle="insetGrouped" navigationTitle="润色超时">
-        <Section
-          header={
-            <Text font="caption" foregroundStyle="secondaryLabel">
-              当前 {picked}s
-            </Text>
-          }
-          footer={
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              网速慢 / 海外 / 蜂窝网络建议 30s+；超时后会降级插入未润色原文。
-            </Text>
-          }
-        >
-          <Picker
-            title="polish timeout"
-            pickerStyle="segmented"
-            value={picked}
-            onChanged={(v) => {
-              writePolishTimeoutSec(v as number)
-              setPicked(v as number)
-            }}
-          >
-            <Text tag={10}>10s</Text>
-            <Text tag={20}>20s</Text>
-            <Text tag={30}>30s</Text>
-            <Text tag={60}>60s</Text>
-          </Picker>
-        </Section>
-      </List>
-    )
-  }
-
-  function KeyboardTuneView() {
-    // Stage 7 post-ship — localResetCounter 本地化。点重置按钮时 setLocalResetCounter(c+1)
-    // 让本子页立即重渲染，TuneSlider/TuneToggle 的 key 随之变化 → unmount/remount
-    // → 内部 useState val 重新调 readTune() 拿 def。之前用 MainView 的 tuneResetCounter
-    // 是 stale，重置按钮视觉无感知。
-    const [localResetCounter, setLocalResetCounter] = useState(0)
-    const KBD_TITLES = new Set([
-      "键盘整体",
-      "顶行布局",
-      "状态标签（左上）",
-      "右上时码",
-      "模式条（口述/自动/翻译）",
-      "主胶囊麦克风",
-    ])
-    const kbdSections = TUNE_SECTIONS.filter((s) => KBD_TITLES.has(s.title))
-    const kbdBoolSections = TUNE_BOOL_SECTIONS.filter(
-      (s) => s.title === "系统键盘层（iOS 原生）"
-    )
-    return (
-      <List listStyle="insetGrouped" navigationTitle="键盘调参">
-        <Section
-          footer={
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              拖动 → 写 Storage → 键盘 ≤400ms 同步生效。带蓝色数值 = 已偏离默认。
-            </Text>
-          }
-        >
-          <Button
-            role="destructive"
-            action={() => {
-              kbdSections.forEach((s) =>
-                s.params.forEach(([key, , , , def]) => writeTune(key, def))
-              )
-              kbdBoolSections.forEach((s) =>
-                s.params.forEach(([key, , def]) => writeTuneBool(key, def))
-              )
-              setLocalResetCounter((c) => c + 1)
-              log("keyboard tune reset to defaults")
-            }}
-          >
-            <Label
-              title="重置键盘默认值"
-              systemImage="arrow.counterclockwise"
-            />
-          </Button>
-        </Section>
-        {kbdSections.map((section) => (
-          <Section key={section.title} title={section.title}>
-            {section.params.map(([keyName, label, min, max, def]) => (
-              <TuneSlider
-                key={`${keyName}-${localResetCounter}`}
-                keyName={keyName}
-                label={label}
-                min={min}
-                max={max}
-                def={def}
-              />
-            ))}
-          </Section>
-        ))}
-        {kbdBoolSections.map((section) => (
-          <Section key={section.title} title={section.title}>
-            {section.params.map(([keyName, label, def]) => (
-              <TuneToggle
-                key={`${keyName}-${localResetCounter}`}
-                keyName={keyName}
-                label={label}
-                def={def}
-              />
-            ))}
-          </Section>
-        ))}
-      </List>
-    )
-  }
-
-  function DynamicIslandTuneView() {
-    const [localResetCounter, setLocalResetCounter] = useState(0)
-    const DI_TITLES = new Set([
-      "灵动岛 · 紧凑态 + 最小",
-      "灵动岛 · 展开左（VOICEBOARD + 图标）",
-      "灵动岛 · 展开右（主文案 · 首字左对齐）",
-    ])
-    const diSections = TUNE_SECTIONS.filter((s) => DI_TITLES.has(s.title))
-    const diBoolSections = TUNE_BOOL_SECTIONS.filter(
-      (s) => s.title === "灵动岛 · 显隐开关"
-    )
-    return (
-      <List listStyle="insetGrouped" navigationTitle="灵动岛调参">
-        <Section
-          footer={
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              拖动 → 写 Storage → Live Activity ≤1s 同步生效。
-            </Text>
-          }
-        >
-          <Button
-            role="destructive"
-            action={() => {
-              diSections.forEach((s) =>
-                s.params.forEach(([key, , , , def]) => writeTune(key, def))
-              )
-              diBoolSections.forEach((s) =>
-                s.params.forEach(([key, , def]) => writeTuneBool(key, def))
-              )
-              setLocalResetCounter((c) => c + 1)
-              log("dynamic island tune reset to defaults")
-            }}
-          >
-            <Label
-              title="重置灵动岛默认值"
-              systemImage="arrow.counterclockwise"
-            />
-          </Button>
-        </Section>
-        {diSections.map((section) => (
-          <Section key={section.title} title={section.title}>
-            {section.params.map(([keyName, label, min, max, def]) => (
-              <TuneSlider
-                key={`${keyName}-${localResetCounter}`}
-                keyName={keyName}
-                label={label}
-                min={min}
-                max={max}
-                def={def}
-              />
-            ))}
-          </Section>
-        ))}
-        {diBoolSections.map((section) => (
-          <Section key={section.title} title={section.title}>
-            {section.params.map(([keyName, label, def]) => (
-              <TuneToggle
-                key={`${keyName}-${localResetCounter}`}
-                keyName={keyName}
-                label={label}
-                def={def}
-              />
-            ))}
-          </Section>
-        ))}
-      </List>
-    )
-  }
-
-  function LogView() {
-    // Stage 7 bugfix — LogView 独立刷新。NavigationLink 的 destination
-    // 一旦 push 就和 MainView 闭包脱钩：MainView 的 setTick 不会触发已
-    // mount 的 LogView 重渲染。必须自己 useState + setTimeout 轮询，
-    // 并在 render body 直接调 readLog() 拿最新值。否则"清空"虽然清了
-    // Storage，UI 还停在 mount 时的快照。
-    const [viewTick, setViewTick] = useState(0)
-    useEffect(() => {
-      let cancelled = false
-      const poll = () => {
-        if (cancelled) return
-        setViewTick((v) => v + 1)
-        setTimeout(poll, 800)
-      }
-      const h = setTimeout(poll, 800)
-      return () => {
-        cancelled = true
-        clearTimeout(h)
-      }
-    }, [])
-    void viewTick
-
-    const entries = readLog()
-    const recent = entries.slice(-200)
-    const recentText = formatLog(recent)
-
-    return (
-      <List listStyle="insetGrouped" navigationTitle="日志">
-        <Section>
-          <Button
-            action={async () => {
-              const all = formatLog(readLog())
-              await Pasteboard.setString(all)
-              log("log copied to pasteboard ·", all.length, "chars")
-            }}
-          >
-            <Label title="复制全部" systemImage="doc.on.doc" />
-          </Button>
-          <Button
-            role="destructive"
-            action={() => {
-              clearLog()
-              setViewTick((v) => v + 1)
-            }}
-          >
-            <Label title="清空" systemImage="trash" />
-          </Button>
-        </Section>
-        <Section title={`最近 ${entries.length} 条`}>
-          <Text font="footnote">
-            {recentText.length > 0 ? recentText : "(空)"}
-          </Text>
-        </Section>
-      </List>
-    )
-  }
-
-  function DebugInfoView() {
-    // Stage 7 post-ship — 独立 800ms 轮询。NavigationLink push 后与 MainView
-    // 脱钩；render body 直接 readSttMs/readPolishMs/readHeartbeat 拿最新；
-    // BackgroundKeeper.isActive 是 async，本地 state 镜像。
-    const [viewTick, setViewTick] = useState(0)
-    const [localBgActive, setLocalBgActive] = useState<boolean | null>(null)
-    useEffect(() => {
-      let cancelled = false
-      const poll = () => {
-        if (cancelled) return
-        setViewTick((v) => v + 1)
-        BackgroundKeeper.isActive
-          .then((a) => {
-            if (!cancelled) setLocalBgActive(a)
-          })
-          .catch(() => {})
-        setTimeout(poll, 800)
-      }
-      const h = setTimeout(poll, 800)
-      BackgroundKeeper.isActive
-        .then((a) => {
-          if (!cancelled) setLocalBgActive(a)
-        })
-        .catch(() => {})
-      return () => {
-        cancelled = true
-        clearTimeout(h)
-      }
-    }, [])
-    void viewTick
-
-    const sttMsNow = readSttMs()
-    const polishMsNow = readPolishMs()
-    const latencyNow = (() => {
-      if (sttMsNow === null && polishMsNow === null) return null
-      const parts: string[] = []
-      if (sttMsNow !== null) parts.push(`STT ${fmtSec(sttMsNow)}`)
-      if (polishMsNow !== null) parts.push(`polish ${fmtSec(polishMsNow)}`)
-      if (sttMsNow !== null && polishMsNow !== null) {
-        parts.push(`合计 ${fmtSec(sttMsNow + polishMsNow)}`)
-      }
-      return parts.join(" · ")
-    })()
-    const heartbeatNow = readHeartbeat()
-    const heartbeatAgoNow =
-      heartbeatNow !== null
-        ? ((Date.now() - heartbeatNow) / 1000).toFixed(1)
-        : "—"
-    const qpNow = JSON.stringify(Script.queryParameters ?? {})
-
-    return (
-      <List listStyle="insetGrouped" navigationTitle="调试信息">
-        {latencyNow !== null ? (
-          <Section title="链路耗时">
-            <Text font="footnote" foregroundStyle="systemBlue">
-              {latencyNow}
-            </Text>
-          </Section>
-        ) : null}
-        <Section title="运行时">
-          <HStack>
-            <Text font="footnote">BackgroundKeeper.isActive</Text>
-            <Spacer />
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              {localBgActive === null ? "…" : String(localBgActive)}
-            </Text>
-          </HStack>
-          <HStack>
-            <Text font="footnote">sessionActive</Text>
-            <Spacer />
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              {String(sessionActive)}
-            </Text>
-          </HStack>
-          <HStack>
-            <Text font="footnote">recorder</Text>
-            <Spacer />
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              {recorder !== null ? "running" : "—"}
-            </Text>
-          </HStack>
-          <HStack>
-            <Text font="footnote">silentKeeper</Text>
-            <Spacer />
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              {silentKeeper !== null ? "running" : "—"}
-            </Text>
-          </HStack>
-          <HStack>
-            <Text font="footnote">heartbeat</Text>
-            <Spacer />
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              {heartbeatAgoNow}s ago
-            </Text>
-          </HStack>
-          <HStack>
-            <Text font="footnote">Script.name</Text>
-            <Spacer />
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              {Script.name}
-            </Text>
-          </HStack>
-          <HStack>
-            <Text font="footnote">lastRecorderError</Text>
-            <Spacer />
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              {lastRecorderError ?? "—"}
-            </Text>
-          </HStack>
-        </Section>
-        <Section title="queryParameters">
-          <Text font="footnote" foregroundStyle="secondaryLabel">
-            {qpNow}
-          </Text>
-        </Section>
-      </List>
-    )
-  }
-
-  function ExperimentsView() {
-    // Stage 7 post-ship — 独立 1000ms 轮询触发重渲染，让实验运行中倒计时 +
-    // 5 分钟跑完后的结果都能实时反映。module-level expResults/expRunning/
-    // expEndAt/expFirstHeartbeatAt/sessionActive 直接在 render body 读。
-    const [viewTick, setViewTick] = useState(0)
-    useEffect(() => {
-      let cancelled = false
-      const poll = () => {
-        if (cancelled) return
-        setViewTick((v) => v + 1)
-        setTimeout(poll, 1000)
-      }
-      const h = setTimeout(poll, 1000)
-      return () => {
-        cancelled = true
-        clearTimeout(h)
-      }
-    }, [])
-    void viewTick
-
-    const labelFor = (id: ExperimentId): string =>
-      id === "A1"
-        ? "A1 · 裸 keepAlive"
-        : id === "A2"
-        ? "A2 · keepAlive + Live Activity"
-        : id === "A3"
-        ? "A3 · keepAlive + 静音录音"
-        : "A4 · keepAlive + LA + 静音录音"
-    const iconFor = (id: ExperimentId): string =>
-      id === "A1"
-        ? "1.circle"
-        : id === "A2"
-        ? "2.circle"
-        : id === "A3"
-        ? "3.circle"
-        : "4.circle"
-    return (
-      <List
-        listStyle="insetGrouped"
-        navigationTitle="保活机制实测"
-      >
-        <Section
-          header={
-            <Text font="caption" foregroundStyle="secondaryLabel">
-              历史结果
-            </Text>
-          }
-          footer={
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              4.5a 实验（不影响正常录音链路）。运行前请确保主流程不在 warm/armed 态。
-            </Text>
-          }
-        >
-          {(["A1", "A2", "A3", "A4"] as ExperimentId[]).map((id) => {
-            const r = expResults[id]
-            const result =
-              r === undefined
-                ? "—"
-                : r.firstHeartbeatAt === 0
-                ? `error at ${((r.endedAt - r.startedAt) / 1000).toFixed(1)}s`
-                : `存活 ${(
-                    (r.lastHeartbeatAt - r.firstHeartbeatAt) /
-                    1000
-                  ).toFixed(1)}s · ${r.cause}`
-            return (
-              <HStack key={`result-${id}`}>
-                <Text font="footnote">{labelFor(id)}</Text>
-                <Spacer />
-                <Text
-                  font="footnote"
-                  foregroundStyle={
-                    r === undefined ? "secondaryLabel" : "systemBlue"
-                  }
-                >
-                  {result}
-                </Text>
-              </HStack>
-            )
-          })}
-        </Section>
-        {expRunning !== null ? (
-          <Section title="运行中">
-            <HStack>
-              <Image systemName="hourglass" foregroundStyle="orange" />
-              <Text font="footnote" foregroundStyle="orange">
-                {expRunning} · 剩余{" "}
-                {Math.max(0, Math.floor((expEndAt - Date.now()) / 1000))}
-                s
-              </Text>
-              <Spacer />
-            </HStack>
-            <Button
-              role="destructive"
-              action={async () => {
-                await cancelExperiment()
-                setViewTick((t) => t + 1)
-              }}
-            >
-              <Label title="提前结束" systemImage="stop.circle" />
-            </Button>
-          </Section>
-        ) : null}
-        <Section title="运行实验">
-          {(["A1", "A2", "A3", "A4"] as ExperimentId[]).map((id) => (
-            <Button
-              key={`run-${id}`}
-              action={() => {
-                if (expRunning !== null || sessionActive) {
-                  log(`${id} tap ignored · busy`)
-                  return
-                }
-                runExperiment(id)
-                setViewTick((t) => t + 1)
-              }}
-            >
-              <Label title={labelFor(id)} systemImage={iconFor(id)} />
-            </Button>
-          ))}
-        </Section>
-        <Section
-          header={
-            <Text font="caption" foregroundStyle="secondaryLabel">
-              onResume 路径
-            </Text>
-          }
-          footer={
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              点拷贝 URL，切到备忘录粘贴并点击链接，应看到日志新增 "onResume fired" 且没有 "script run · env="。
-            </Text>
-          }
-        >
-          <Button
-            action={async () => {
-              const url = `scripting://run/${encodeURIComponent(
-                Script.name
-              )}?probe=1`
-              await Pasteboard.setString(url)
-              log("onResume probe URL copied:", url)
-            }}
-          >
-            <Label title="拷贝 probe URL" systemImage="link" />
-          </Button>
-        </Section>
-      </List>
-    )
-  }
+  // Stage 7 post-ship — 原来这里有 nested 6 subview,现已全部提到 top-level
+  // FunctionComponent(文件顶部,TuneToggle 之后)。AdvancedView 仍 nested 以便
+  // 读 MainView closure(state / onEnd / startSession 等)。
 
   function AdvancedView() {
     return (
