@@ -1821,9 +1821,6 @@ function MainView() {
   const dismiss = Navigation.useDismiss()
   const [tick, setTick] = useState(0)
   const [bgActive, setBgActive] = useState<boolean | null>(null)
-  // Stage 6a — 调参面板重置计数。点「重置全部」会 +1，所有 TuneSlider
-  // 的 key 带上这个 suffix 从而强制 unmount/remount，重读 Storage 的新值。
-  const [tuneResetCounter, setTuneResetCounter] = useState(0)
   const [scribeKeyDraft, setScribeKeyDraft] = useState<string>(
     readScribeKey() ?? ""
   )
@@ -1837,11 +1834,10 @@ function MainView() {
     if (prev !== null && prev > 0) return Math.round(prev / 60000)
     return 3
   })
-  // Stage 5b — polish timeout picker 当前选择（秒）。readPolishTimeoutSec
-  // 对脏数据 / 未设置过自动 fallback 到默认 20s，拿回来就是合法值。
-  const [polishTimeoutPick, setPolishTimeoutPick] = useState<number>(() =>
-    readPolishTimeoutSec()
-  )
+  // Stage 7 post-ship — tuneResetCounter 与 polishTimeoutPick 已从 MainView
+  // 下沉到各自孙子页本地 useState。原因：这些 state 只被 push 到导航栈的
+  // Tune/PolishTimeout 子页使用，而孙子页 mount 后与 MainView 重渲染脱钩，
+  // 放在 MainView 的 state 等于 stale。下沉后按钮事件直接触发本子页重渲染。
 
   useEffect(() => {
     const q = Script.queryParameters ?? {}
@@ -1930,7 +1926,6 @@ function MainView() {
   const filePath = readFilePath()
   const err = readError()
   const errKind = readErrorKind()
-  const heartbeat = readHeartbeat()
   const rawText = readRawText()
   const finalText = readFinalText()
   const sttMs = readSttMs()
@@ -1938,10 +1933,10 @@ function MainView() {
   const warmUntil = readWarmUntil()
   const warmDurationMs = readWarmDurationMs()
   const q = Script.queryParameters ?? {}
-  const qpStr = JSON.stringify(q)
+  // Stage 7 post-ship — AdvancedView 入口需要显示日志条目数,这是唯一用途。
+  // 其他 MainView 顶部原有的 heartbeat/qpStr/recentLogText 派生值已随子页
+  // 独立刷新改造移除(各子页自己读)。
   const logEntries = readLog()
-  const recentLog = logEntries.slice(-200)
-  const recentLogText = formatLog(recentLog)
 
   const now = Date.now()
   const recordingSec =
@@ -1954,8 +1949,6 @@ function MainView() {
     sessionEndedAt !== null
       ? ((sessionEndedAt - sessionStartedAt) / 1000).toFixed(1)
       : null
-  const heartbeatAgo =
-    heartbeat !== null ? ((now - heartbeat) / 1000).toFixed(1) : "—"
   // Stage 4.5b — warm 剩余秒数 / mm:ss 显示
   const warmRemainingSec =
     warmUntil !== null ? Math.max(0, Math.floor((warmUntil - now) / 1000)) : 0
@@ -2060,12 +2053,15 @@ function MainView() {
   // 所有孙子页都是 nested function，闭包共享 MainView 的 state / 派生值 / 模块级业务函数。
 
   function PolishTimeoutView() {
+    // Stage 7 post-ship — 本地 state 下沉。Picker 的 value 和 onChanged 都
+    // 在本子页内消化；写 Storage 让 worker 的下一次 polish fetch 能读到新值。
+    const [picked, setPicked] = useState<number>(() => readPolishTimeoutSec())
     return (
       <List listStyle="insetGrouped" navigationTitle="润色超时">
         <Section
           header={
             <Text font="caption" foregroundStyle="secondaryLabel">
-              当前 {polishTimeoutPick}s
+              当前 {picked}s
             </Text>
           }
           footer={
@@ -2077,11 +2073,10 @@ function MainView() {
           <Picker
             title="polish timeout"
             pickerStyle="segmented"
-            value={polishTimeoutPick}
+            value={picked}
             onChanged={(v) => {
               writePolishTimeoutSec(v as number)
-              setPolishTimeoutPick(v as number)
-              setTick((t) => t + 1)
+              setPicked(v as number)
             }}
           >
             <Text tag={10}>10s</Text>
@@ -2095,6 +2090,11 @@ function MainView() {
   }
 
   function KeyboardTuneView() {
+    // Stage 7 post-ship — localResetCounter 本地化。点重置按钮时 setLocalResetCounter(c+1)
+    // 让本子页立即重渲染，TuneSlider/TuneToggle 的 key 随之变化 → unmount/remount
+    // → 内部 useState val 重新调 readTune() 拿 def。之前用 MainView 的 tuneResetCounter
+    // 是 stale，重置按钮视觉无感知。
+    const [localResetCounter, setLocalResetCounter] = useState(0)
     const KBD_TITLES = new Set([
       "键盘整体",
       "顶行布局",
@@ -2125,7 +2125,7 @@ function MainView() {
               kbdBoolSections.forEach((s) =>
                 s.params.forEach(([key, , def]) => writeTuneBool(key, def))
               )
-              setTuneResetCounter((c) => c + 1)
+              setLocalResetCounter((c) => c + 1)
               log("keyboard tune reset to defaults")
             }}
           >
@@ -2139,7 +2139,7 @@ function MainView() {
           <Section key={section.title} title={section.title}>
             {section.params.map(([keyName, label, min, max, def]) => (
               <TuneSlider
-                key={`${keyName}-${tuneResetCounter}`}
+                key={`${keyName}-${localResetCounter}`}
                 keyName={keyName}
                 label={label}
                 min={min}
@@ -2153,7 +2153,7 @@ function MainView() {
           <Section key={section.title} title={section.title}>
             {section.params.map(([keyName, label, def]) => (
               <TuneToggle
-                key={`${keyName}-${tuneResetCounter}`}
+                key={`${keyName}-${localResetCounter}`}
                 keyName={keyName}
                 label={label}
                 def={def}
@@ -2166,6 +2166,7 @@ function MainView() {
   }
 
   function DynamicIslandTuneView() {
+    const [localResetCounter, setLocalResetCounter] = useState(0)
     const DI_TITLES = new Set([
       "灵动岛 · 紧凑态 + 最小",
       "灵动岛 · 展开左（VOICEBOARD + 图标）",
@@ -2193,7 +2194,7 @@ function MainView() {
               diBoolSections.forEach((s) =>
                 s.params.forEach(([key, , def]) => writeTuneBool(key, def))
               )
-              setTuneResetCounter((c) => c + 1)
+              setLocalResetCounter((c) => c + 1)
               log("dynamic island tune reset to defaults")
             }}
           >
@@ -2207,7 +2208,7 @@ function MainView() {
           <Section key={section.title} title={section.title}>
             {section.params.map(([keyName, label, min, max, def]) => (
               <TuneSlider
-                key={`${keyName}-${tuneResetCounter}`}
+                key={`${keyName}-${localResetCounter}`}
                 keyName={keyName}
                 label={label}
                 min={min}
@@ -2221,7 +2222,7 @@ function MainView() {
           <Section key={section.title} title={section.title}>
             {section.params.map(([keyName, label, def]) => (
               <TuneToggle
-                key={`${keyName}-${tuneResetCounter}`}
+                key={`${keyName}-${localResetCounter}`}
                 keyName={keyName}
                 label={label}
                 def={def}
@@ -2234,6 +2235,31 @@ function MainView() {
   }
 
   function LogView() {
+    // Stage 7 bugfix — LogView 独立刷新。NavigationLink 的 destination
+    // 一旦 push 就和 MainView 闭包脱钩：MainView 的 setTick 不会触发已
+    // mount 的 LogView 重渲染。必须自己 useState + setTimeout 轮询，
+    // 并在 render body 直接调 readLog() 拿最新值。否则"清空"虽然清了
+    // Storage，UI 还停在 mount 时的快照。
+    const [viewTick, setViewTick] = useState(0)
+    useEffect(() => {
+      let cancelled = false
+      const poll = () => {
+        if (cancelled) return
+        setViewTick((v) => v + 1)
+        setTimeout(poll, 800)
+      }
+      const h = setTimeout(poll, 800)
+      return () => {
+        cancelled = true
+        clearTimeout(h)
+      }
+    }, [])
+    void viewTick
+
+    const entries = readLog()
+    const recent = entries.slice(-200)
+    const recentText = formatLog(recent)
+
     return (
       <List listStyle="insetGrouped" navigationTitle="日志">
         <Section>
@@ -2242,7 +2268,6 @@ function MainView() {
               const all = formatLog(readLog())
               await Pasteboard.setString(all)
               log("log copied to pasteboard ·", all.length, "chars")
-              setTick((v) => v + 1)
             }}
           >
             <Label title="复制全部" systemImage="doc.on.doc" />
@@ -2251,15 +2276,15 @@ function MainView() {
             role="destructive"
             action={() => {
               clearLog()
-              setTick((v) => v + 1)
+              setViewTick((v) => v + 1)
             }}
           >
             <Label title="清空" systemImage="trash" />
           </Button>
         </Section>
-        <Section title={`最近 ${logEntries.length} 条`}>
+        <Section title={`最近 ${entries.length} 条`}>
           <Text font="footnote">
-            {recentLogText.length > 0 ? recentLogText : "(空)"}
+            {recentText.length > 0 ? recentText : "(空)"}
           </Text>
         </Section>
       </List>
@@ -2267,12 +2292,61 @@ function MainView() {
   }
 
   function DebugInfoView() {
+    // Stage 7 post-ship — 独立 800ms 轮询。NavigationLink push 后与 MainView
+    // 脱钩；render body 直接 readSttMs/readPolishMs/readHeartbeat 拿最新；
+    // BackgroundKeeper.isActive 是 async，本地 state 镜像。
+    const [viewTick, setViewTick] = useState(0)
+    const [localBgActive, setLocalBgActive] = useState<boolean | null>(null)
+    useEffect(() => {
+      let cancelled = false
+      const poll = () => {
+        if (cancelled) return
+        setViewTick((v) => v + 1)
+        BackgroundKeeper.isActive
+          .then((a) => {
+            if (!cancelled) setLocalBgActive(a)
+          })
+          .catch(() => {})
+        setTimeout(poll, 800)
+      }
+      const h = setTimeout(poll, 800)
+      BackgroundKeeper.isActive
+        .then((a) => {
+          if (!cancelled) setLocalBgActive(a)
+        })
+        .catch(() => {})
+      return () => {
+        cancelled = true
+        clearTimeout(h)
+      }
+    }, [])
+    void viewTick
+
+    const sttMsNow = readSttMs()
+    const polishMsNow = readPolishMs()
+    const latencyNow = (() => {
+      if (sttMsNow === null && polishMsNow === null) return null
+      const parts: string[] = []
+      if (sttMsNow !== null) parts.push(`STT ${fmtSec(sttMsNow)}`)
+      if (polishMsNow !== null) parts.push(`polish ${fmtSec(polishMsNow)}`)
+      if (sttMsNow !== null && polishMsNow !== null) {
+        parts.push(`合计 ${fmtSec(sttMsNow + polishMsNow)}`)
+      }
+      return parts.join(" · ")
+    })()
+    const heartbeatNow = readHeartbeat()
+    const heartbeatAgoNow =
+      heartbeatNow !== null
+        ? ((Date.now() - heartbeatNow) / 1000).toFixed(1)
+        : "—"
+    const qpNow = JSON.stringify(Script.queryParameters ?? {})
+
     return (
       <List listStyle="insetGrouped" navigationTitle="调试信息">
-        {latencyLine !== null ? (
+        {latencyNow !== null ? (
           <Section title="链路耗时">
             <Text font="footnote" foregroundStyle="systemBlue">
-              {latencyLine}
+              {latencyNow}
             </Text>
           </Section>
         ) : null}
@@ -2281,7 +2355,7 @@ function MainView() {
             <Text font="footnote">BackgroundKeeper.isActive</Text>
             <Spacer />
             <Text font="footnote" foregroundStyle="secondaryLabel">
-              {bgActive === null ? "…" : String(bgActive)}
+              {localBgActive === null ? "…" : String(localBgActive)}
             </Text>
           </HStack>
           <HStack>
@@ -2309,7 +2383,7 @@ function MainView() {
             <Text font="footnote">heartbeat</Text>
             <Spacer />
             <Text font="footnote" foregroundStyle="secondaryLabel">
-              {heartbeatAgo}s ago
+              {heartbeatAgoNow}s ago
             </Text>
           </HStack>
           <HStack>
@@ -2317,13 +2391,6 @@ function MainView() {
             <Spacer />
             <Text font="footnote" foregroundStyle="secondaryLabel">
               {Script.name}
-            </Text>
-          </HStack>
-          <HStack>
-            <Text font="footnote">tick</Text>
-            <Spacer />
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              {tick}
             </Text>
           </HStack>
           <HStack>
@@ -2336,7 +2403,7 @@ function MainView() {
         </Section>
         <Section title="queryParameters">
           <Text font="footnote" foregroundStyle="secondaryLabel">
-            {qpStr}
+            {qpNow}
           </Text>
         </Section>
       </List>
@@ -2344,6 +2411,25 @@ function MainView() {
   }
 
   function ExperimentsView() {
+    // Stage 7 post-ship — 独立 1000ms 轮询触发重渲染，让实验运行中倒计时 +
+    // 5 分钟跑完后的结果都能实时反映。module-level expResults/expRunning/
+    // expEndAt/expFirstHeartbeatAt/sessionActive 直接在 render body 读。
+    const [viewTick, setViewTick] = useState(0)
+    useEffect(() => {
+      let cancelled = false
+      const poll = () => {
+        if (cancelled) return
+        setViewTick((v) => v + 1)
+        setTimeout(poll, 1000)
+      }
+      const h = setTimeout(poll, 1000)
+      return () => {
+        cancelled = true
+        clearTimeout(h)
+      }
+    }, [])
+    void viewTick
+
     const labelFor = (id: ExperimentId): string =>
       id === "A1"
         ? "A1 · 裸 keepAlive"
@@ -2419,7 +2505,7 @@ function MainView() {
               role="destructive"
               action={async () => {
                 await cancelExperiment()
-                setTick((t) => t + 1)
+                setViewTick((t) => t + 1)
               }}
             >
               <Label title="提前结束" systemImage="stop.circle" />
@@ -2436,7 +2522,7 @@ function MainView() {
                   return
                 }
                 runExperiment(id)
-                setTick((t) => t + 1)
+                setViewTick((t) => t + 1)
               }}
             >
               <Label title={labelFor(id)} systemImage={iconFor(id)} />
@@ -2462,7 +2548,6 @@ function MainView() {
               )}?probe=1`
               await Pasteboard.setString(url)
               log("onResume probe URL copied:", url)
-              setTick((t) => t + 1)
             }}
           >
             <Label title="拷贝 probe URL" systemImage="link" />
