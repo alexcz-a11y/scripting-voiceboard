@@ -27,6 +27,9 @@ reference/
 # Claude Code local guidance file — personal workspace, not source.
 CLAUDE.md
 
+# Claude Code preview server config — personal workspace, not source.
+.claude/launch.json
+
 # Secrets / local env
 .env
 .env.*

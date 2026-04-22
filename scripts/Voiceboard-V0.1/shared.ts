@@ -27,6 +27,11 @@ export const K_POLISH_TIMEOUT_SEC = "vb:polishTimeoutSec"
 export const DEFAULT_POLISH_TIMEOUT_SEC = 20
 export const MIN_POLISH_TIMEOUT_SEC = 5
 export const MAX_POLISH_TIMEOUT_SEC = 120
+// Stage 6a — 键盘顶部三段切换 pill 的当前模式。worker 在 polish 之前读这个
+// 决定走哪条路：dictation 跳过 polish 直接 raw；auto 现有 polish；translation
+// 走「中译英」prompt。跟 polishTimeoutSec 一样是用户偏好，跨 session 保留。
+export const K_INPUT_MODE = "vb:inputMode"
+export const DEFAULT_INPUT_MODE: InputMode = "auto"
 
 export const RECORDINGS_SUBDIR = "Voiceboard"
 // Stage 4.5b — 静音 keeper 录音文件名。warm 窗口内持续录到这里（覆盖写），
@@ -53,6 +58,12 @@ export type VBAction = "stop" | "arm"
 //   polish — OpenAI Responses request failure (STT already succeeded)
 // Keyboard uses this to render the right `[录音失败|转录失败|润色失败: …]` prefix.
 export type VBErrorKind = "setup" | "record" | "stt" | "polish"
+
+// Stage 6a — 键盘顶部三段切换 pill 的输入模式。
+//   dictation   — 跳过 polish，直接插入 Scribe rawText（最贴近原话）
+//   auto        — 默认；现有 polish prompt（标点矫正 + 口语清洗）
+//   translation — polish 用「中译英」prompt（输入中文，输出英文）
+export type InputMode = "dictation" | "auto" | "translation"
 
 const opts = { shared: true } as const
 
@@ -226,6 +237,62 @@ export function writePolishTimeoutSec(sec: number): void {
     Math.min(MAX_POLISH_TIMEOUT_SEC, rounded)
   )
   Storage.set(K_POLISH_TIMEOUT_SEC, clamped, opts)
+}
+
+// Stage 6a — 输入模式持久化。读：脏数据（任何不在合法集合的值）回退到默认
+// "auto"，与 polishTimeoutSec 一样防御 Storage 跨进程的静默错值。
+export function readInputMode(): InputMode {
+  const v = Storage.get<string>(K_INPUT_MODE, opts)
+  if (v === "dictation" || v === "auto" || v === "translation") {
+    return v
+  }
+  return DEFAULT_INPUT_MODE
+}
+
+export function writeInputMode(m: InputMode): void {
+  Storage.set(K_INPUT_MODE, m, opts)
+}
+
+export function clearInputMode(): void {
+  Storage.remove(K_INPUT_MODE, opts)
+}
+
+// Stage 6a — 键盘布局调参的通用接口。键名用 `vb:tune:<section>.<param>`。
+// value 都是 number。脏数据（NaN / 非 number / 不存在）回退到调用方 def。
+// 主 app 调参面板写，keyboard.tsx render 每帧读。轮询 ≤400ms 生效。
+const K_TUNE_PREFIX = "vb:tune:"
+
+export function readTune(key: string, def: number): number {
+  const v = Storage.get<number>(K_TUNE_PREFIX + key, opts)
+  if (typeof v !== "number" || !isFinite(v)) return def
+  return v
+}
+
+export function writeTune(key: string, v: number): void {
+  Storage.set(K_TUNE_PREFIX + key, v, opts)
+}
+
+export function clearTune(key: string): void {
+  Storage.remove(K_TUNE_PREFIX + key, opts)
+}
+
+// Stage 6a Phase C — 布尔类 tune（开关 toggle）。与 readTune 并列：
+// 键名用 `vb:tuneBool:<section>.<param>`，与 number tune 分开 prefix 避免碰撞。
+// 脏数据（非 boolean / 不存在）回退到调用方 def。
+const K_TUNE_BOOL_PREFIX = "vb:tuneBool:"
+
+export function readTuneBool(key: string, def: boolean): boolean {
+  const v = Storage.get<boolean>(K_TUNE_BOOL_PREFIX + key, opts)
+  if (typeof v !== "boolean") return def
+  return v
+}
+
+export function writeTuneBool(key: string, v: boolean): void {
+  Storage.set(K_TUNE_BOOL_PREFIX + key, v, opts)
+}
+
+export function clearTuneBool(key: string): void {
+  Storage.remove(K_TUNE_BOOL_PREFIX + key, opts)
 }
 
 export function readScribeKey(): string | null {
