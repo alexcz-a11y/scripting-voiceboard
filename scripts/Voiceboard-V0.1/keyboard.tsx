@@ -125,7 +125,7 @@ function micCapsuleLabel(mode: Mode, state: VBState, hasErr: boolean): string {
     case "idle":      return "开始录音"
     case "warm":      return "开始录音"
     case "recording": return "结束录音"
-    case "processing": return state === "transcribing" ? "转录中…" : "润色中…"
+    case "processing": return state === "transcribing" ? "转录中" : "润色中"
     case "done":      return "已插入"
     default:          return "开始录音"
   }
@@ -728,6 +728,16 @@ function VoiceboardKeyboard() {
                 }
                 font={tune.tagIconSize}
                 foregroundStyle={accent}
+                contentTransition="symbolEffectReplace"
+                symbolEffect={
+                  mode === "processing"
+                    ? { effect: "rotate", value: state }
+                    : undefined
+                }
+                animation={{
+                  animation: Animation.default(),
+                  value: `${mode}:${hasErr ? 1 : 0}`,
+                }}
               />
               <Text
                 font={tune.tagTextSize}
@@ -751,6 +761,11 @@ function VoiceboardKeyboard() {
             foregroundStyle={hasErr ? accent : "secondaryLabel"}
             monospacedDigit
             offset={{ x: tune.monoOffsetX, y: tune.monoOffsetY }}
+            contentTransition="numericText"
+            animation={{
+              animation: Animation.default(),
+              value: rightText,
+            }}
           >
             {rightText}
           </Text>
@@ -802,6 +817,16 @@ function VoiceboardKeyboard() {
               systemName={micSym}
               font={tune.micIconSize}
               foregroundStyle="white"
+              contentTransition="symbolEffectReplace"
+              symbolEffect={
+                mode === "processing"
+                  ? { effect: "rotate", value: state }
+                  : undefined
+              }
+              animation={{
+                animation: Animation.default(),
+                value: `${mode}:${hasErr ? 1 : 0}`,
+              }}
             />
             <Text
               font={tune.micTextSize}
@@ -810,6 +835,17 @@ function VoiceboardKeyboard() {
             >
               {micText}
             </Text>
+            {mode === "processing" ? (
+              <Image
+                systemName="ellipsis"
+                font={tune.micTextSize}
+                foregroundStyle="white"
+                symbolEffect={{
+                  effect: "variableColorCumulative",
+                  value: state,
+                }}
+              />
+            ) : null}
           </HStack>
         </Button>
         <Spacer />
