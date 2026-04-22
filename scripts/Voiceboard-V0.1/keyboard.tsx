@@ -734,6 +734,10 @@ function VoiceboardKeyboard() {
                     ? { effect: "rotate", value: state }
                     : undefined
                 }
+                animation={{
+                  animation: Animation.default(),
+                  value: `${mode}:${hasErr ? 1 : 0}`,
+                }}
               />
               <Text
                 font={tune.tagTextSize}
@@ -758,6 +762,10 @@ function VoiceboardKeyboard() {
             monospacedDigit
             offset={{ x: tune.monoOffsetX, y: tune.monoOffsetY }}
             contentTransition="numericText"
+            animation={{
+              animation: Animation.default(),
+              value: rightText,
+            }}
           >
             {rightText}
           </Text>
@@ -815,6 +823,10 @@ function VoiceboardKeyboard() {
                   ? { effect: "rotate", value: state }
                   : undefined
               }
+              animation={{
+                animation: Animation.default(),
+                value: `${mode}:${hasErr ? 1 : 0}`,
+              }}
             />
             <Text
               font={tune.micTextSize}
