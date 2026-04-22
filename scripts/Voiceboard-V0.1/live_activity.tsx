@@ -180,16 +180,18 @@ function readDiTune() {
     // ----- Minimal -----
     minIconSize:    readTune("di.min.iconSize",  16),
     // ----- Expanded Leading (pill 左侧 + 下方): VOICEBOARD + 大图标 -----
+    // v4.3 真机锁定: el.offsetX=17 (整体往右 17pt，让 Leading 视觉重心在 pill 左下对齐)
     elIconSize:     readTune("di.el.iconSize",   56),
     elBrandIconGap: readTune("di.el.brandIconGap",4),
-    elOffsetX:      readTune("di.el.offsetX",     0),  // 正值往右 / 负值往左
+    elOffsetX:      readTune("di.el.offsetX",    17),  // 正值往右 / 负值往左
     elOffsetY:      readTune("di.el.offsetY",     0),  // 正值往下 / 负值往上
     // ----- Expanded Trailing (pill 右侧 + 下方 wrap): 主文案 headline + caption -----
-    etHeadlineSize: readTune("di.et.headlineSize",17),
-    etCaptionSize:  readTune("di.et.captionSize",12),
+    // v4.3 真机锁定: 文字字号 19/13 · offsetX=-154 把文案从 pill 右列拖回左对齐 Leading 后一列
+    etHeadlineSize: readTune("di.et.headlineSize",19),
+    etCaptionSize:  readTune("di.et.captionSize",13),
     etRowSpacing:   readTune("di.et.rowSpacing",  3),
-    etOffsetX:      readTune("di.et.offsetX",     0),  // 正值往右 / 负值往左
-    etOffsetY:      readTune("di.et.offsetY",     0),  // 正值往下 / 负值往上
+    etOffsetX:      readTune("di.et.offsetX",  -154),  // 正值往右 / 负值往左
+    etOffsetY:      readTune("di.et.offsetY",    -2),  // 正值往下 / 负值往上
     // ----- Voiceboard 品牌字（Leading 顶部） -----
     brandTextSize:  readTune("di.brand.textSize",11),
   }
