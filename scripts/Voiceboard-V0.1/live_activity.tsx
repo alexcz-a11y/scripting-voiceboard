@@ -1,20 +1,22 @@
 // Stage 4.5b — 生产版 Live Activity 注册。
-// Stage 6b v4 — 灵动岛 UI 打磨：
+// Stage 6b v4.1 — 灵动岛 UI（真机反馈后修正）：
 //   · Compact: 仅 leading（删 trailing 图标，让 camera pill 物理占位）
-//   · Expanded: 不对称布局 围绕 TrueDepth pill
-//       Leading region:
-//         顶部 brand label "VOICEBOARD"（pill 左侧空间）
-//         下方 Leading 圆角卡片 · 同心 cornerRadius 32 · 大图标(56pt) 居中
-//       Trailing region:
-//         整个 Trailing 是一张大横卡 · 同心 cornerRadius 32
-//         内含 VStack(headline + caption) 居中
-//       Center region: 不用，返回空 Text
-//       Bottom region: 不加
+//   · Expanded: 3 region 顺延 Apple HIG
+//       Leading  (pill 左侧窄列): VOICEBOARD 品牌字 + 大图标(56pt) 竖排
+//       Center   (pill 正下方居中): 主文案 headline + caption
+//       Trailing (pill 右侧窄列): 空 Text 占位
+//       Bottom   : 不用
 //   · Voiceboard Ink 品牌色板 · DynamicShapeStyle 自动 light/dark
-//   · 视觉参数全部走 readTune(key, def)，主 app 调参面板热调
+//   · 视觉参数全部走 readTune(key, def)
 //
-// 参考: Apple HIG concentric corners (内卡片 r = 外壳 r − padding = 44 − 12 = 32)
-// 设计板: /tmp/voiceboard-design/dynamic-island.html (v4 锁定)
+// v4 真机验证结果 (2026-04-22):
+//   · `background="#FFFFFF14" + cornerRadius=32` 在 LA 子视图里不渲染卡片 →
+//     放弃圆角半透白卡片方案，回到裸文字/图标的 SwiftUI 默认布局
+//   · Trailing region 是 pill **右侧窄列**（不是"pill 下方大横"），主文案
+//     应该放在 Center region（pill 正下方）才能跨 pill 左右居中显示
+//
+// 参考: developer.apple.com/documentation/WidgetKit/DynamicIslandExpandedRegion
+// 设计板: /tmp/voiceboard-design/dynamic-island.html
 //
 // 架构约束（reference/llms-full.md:4647）:
 //   注册必须在独立文件 `live_activity.tsx`。不能塞进 index.tsx。
@@ -153,11 +155,16 @@ function trailingCaption(state: VBActivityState): string {
 }
 
 // --------------------------------------------------------------------------
-// Stage 6b v4 — DI 视觉 tune 读取
+// Stage 6b v4.1 — DI 视觉 tune 读取（精简）
 // --------------------------------------------------------------------------
-// builder 是 iOS 每次 activity.update 时重新调用的函数（dts:7823），
-// 所以 const tune = readDiTune() 每次都拿最新 Storage 值。
-// 调参面板写 Storage → ≤1s 生效（受 LA 1000ms 节流）。
+// builder 每次 iOS update 时重新调用（dts:7823），const tune = readDiTune()
+// 每次重读 Storage → 调参面板 ≤1s（受 LA 1000ms 节流）生效。
+//
+// v4.1 变更（vs v4）：
+//   · 删除卡片背景相关键（真机不渲染）：et.rightPad / ex.cardGap / ex.cardRadius /
+//     ex.cardPad / ex.bottomPad / cards.visible
+//   · 主文案 tune 从 `et.*` 改名 `ec.*`（实际渲染在 Center region，不是 Trailing）
+//   · 新增 el.brandIconGap（Leading 里 VOICEBOARD 和 icon 之间的距离）
 
 function readDiTune() {
   return {
@@ -169,37 +176,24 @@ function readDiTune() {
     clPadV:         readTune("di.cl.padV",        2),
     // ----- Minimal -----
     minIconSize:    readTune("di.min.iconSize",  16),
-    // ----- Expanded Leading 卡 -----
-    elLeftPad:      readTune("di.el.leftPad",    12),
-    elWidth:        readTune("di.el.width",     121),
+    // ----- Expanded Leading (pill 左侧): VOICEBOARD + 大图标 -----
     elIconSize:     readTune("di.el.iconSize",   56),
-    // ----- Expanded Trailing 卡 -----
-    etRightPad:     readTune("di.et.rightPad",   12),
-    etHeadlineSize: readTune("di.et.headlineSize",17),
-    etCaptionSize:  readTune("di.et.captionSize",12),
-    etRowSpacing:   readTune("di.et.rowSpacing",  3),
-    // ----- 通用（两卡共享） -----
-    exCardGap:      readTune("di.ex.cardGap",     8),
-    exTopPad:       readTune("di.ex.topPad",     55),
-    exBottomPad:    readTune("di.ex.bottomPad",  12),
-    exCardRadius:   readTune("di.ex.cardRadius", 32),
-    exCardPad:      readTune("di.ex.cardPad",    12),
-    // ----- Voiceboard 品牌字（Leading 上方 pill 左侧空间） -----
+    elBrandIconGap: readTune("di.el.brandIconGap",4),
+    // ----- Expanded Center (pill 正下方): 主文案 headline + caption -----
+    ecHeadlineSize: readTune("di.ec.headlineSize",17),
+    ecCaptionSize:  readTune("di.ec.captionSize",12),
+    ecRowSpacing:   readTune("di.ec.rowSpacing",  3),
+    // ----- Voiceboard 品牌字（Leading 顶部） -----
     brandTextSize:  readTune("di.brand.textSize",11),
   }
 }
 
 function readDiTuneBool() {
   return {
-    // 显示 Leading 上方 "VOICEBOARD" 品牌字
-    brandVisible:  readTuneBool("di.brand.visible",  true),
-    // Leading/Trailing 卡片背景显示（关掉就是无背景透明卡）
-    cardsVisible:  readTuneBool("di.cards.visible",  true),
+    // 显示 Leading 顶部 "VOICEBOARD" 品牌字
+    brandVisible:  readTuneBool("di.brand.visible", true),
   }
 }
-
-// 半透白色卡片背景 hex (RRGGBBAA): 0x14 ≈ 8% alpha
-const CARD_BG = "#FFFFFF14"
 
 // --------------------------------------------------------------------------
 // Sub-views
@@ -275,54 +269,14 @@ function Minimal(state: VBActivityState) {
   )
 }
 
-// v4: DI 展开态左侧 —— VOICEBOARD 品牌字 + Leading 圆角卡 + 大图标。
-//
-// 布局策略（SwiftUI region 内）：
-//   VStack(spacing=4)
-//     ├ Text "VOICEBOARD"  (顶部, 在 pill 左侧空间内自然落位)
-//     └ VStack 卡片         (Leading 卡片本体, 大图标居中)
-//         · background = CARD_BG (半透白)
-//         · cornerRadius = 32 (concentric)
-//         · frame width = elWidth (121pt)
-//         · padding 内 → 大图标居中
-//
-// brandVisible / cardsVisible 控制开关。
+// v4.1: DI 展开态左侧（pill 左侧窄列）—— VOICEBOARD 品牌字 + 大图标 竖排。
+// 无卡片背景（真机不渲染，回到 SwiftUI 默认布局）。
 function ExpandedLeading(state: VBActivityState) {
   const tune = readDiTune()
   const bools = readDiTuneBool()
   const color = statusBrandColor(state.status)
-
-  const icon = (
-    <Image
-      systemName={statusSymbol(state.status)}
-      foregroundStyle={color}
-      font={tune.elIconSize}
-    />
-  )
-
-  // 卡片包装：cardsVisible=true 时套圆角背景，否则裸图标
-  const card = bools.cardsVisible ? (
-    <VStack
-      alignment="center"
-      padding={tune.exCardPad}
-      background={CARD_BG}
-      cornerRadius={tune.exCardRadius}
-      frame={{ width: tune.elWidth }}
-    >
-      {icon}
-    </VStack>
-  ) : (
-    <VStack
-      alignment="center"
-      padding={tune.exCardPad}
-      frame={{ width: tune.elWidth }}
-    >
-      {icon}
-    </VStack>
-  )
-
   return (
-    <VStack alignment="center" spacing={4}>
+    <VStack alignment="center" spacing={tune.elBrandIconGap}>
       {bools.brandVisible ? (
         <Text
           font={tune.brandTextSize}
@@ -334,29 +288,33 @@ function ExpandedLeading(state: VBActivityState) {
       ) : (
         <Text>{""}</Text>
       )}
-      {card}
+      <Image
+        systemName={statusSymbol(state.status)}
+        foregroundStyle={color}
+        font={tune.elIconSize}
+      />
     </VStack>
   )
 }
 
-// v4: DI 展开态右侧 —— 整张大横卡承载主文案。
-//
-//   VStack 卡片
-//     · background = CARD_BG · cornerRadius = 32
-//     · padding 12
-//     · 内 VStack(spacing=3) headline + caption 居中
-function ExpandedTrailing(state: VBActivityState) {
-  const tune = readDiTune()
-  const bools = readDiTuneBool()
-  const color = statusBrandColor(state.status)
+// v4.1: DI 展开态右侧 —— 空占位（Trailing region 是 pill 右侧窄列，
+// Voiceboard 在 warm/armed 以外没有需要放右列的内容）。
+function ExpandedTrailing(_state: VBActivityState) {
+  return <Text>{""}</Text>
+}
 
-  const inner = (
-    <VStack alignment="center" spacing={tune.etRowSpacing}>
-      <Text font={tune.etHeadlineSize} foregroundStyle={color} bold>
+// v4.1: DI 展开态中部（pill 正下方居中）—— 主文案 headline + caption。
+// 真机上 Center region 渲染在 pill 下方居中位置，可跨 pill 左右宽度。
+function ExpandedCenter(state: VBActivityState) {
+  const tune = readDiTune()
+  const color = statusBrandColor(state.status)
+  return (
+    <VStack alignment="center" spacing={tune.ecRowSpacing}>
+      <Text font={tune.ecHeadlineSize} foregroundStyle={color} bold>
         {trailingHeadline(state)}
       </Text>
       <Text
-        font={tune.etCaptionSize}
+        font={tune.ecCaptionSize}
         foregroundStyle="secondaryLabel"
         monospacedDigit
       >
@@ -364,30 +322,6 @@ function ExpandedTrailing(state: VBActivityState) {
       </Text>
     </VStack>
   )
-
-  if (bools.cardsVisible) {
-    return (
-      <VStack
-        alignment="center"
-        padding={tune.exCardPad}
-        background={CARD_BG}
-        cornerRadius={tune.exCardRadius}
-      >
-        {inner}
-      </VStack>
-    )
-  }
-  return (
-    <VStack alignment="center" padding={tune.exCardPad}>
-      {inner}
-    </VStack>
-  )
-}
-
-// v4: DI 展开态中部 —— 不用 Center region，Trailing 卡承载所有主文案。
-// API 要求 LiveActivityUIExpandedCenter 必须有 element，给空 Text 占位。
-function ExpandedCenter(_state: VBActivityState) {
-  return <Text>{""}</Text>
 }
 
 // --------------------------------------------------------------------------
