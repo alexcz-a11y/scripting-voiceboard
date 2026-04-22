@@ -1760,6 +1760,26 @@ const TUNE_BOOL_SECTIONS: Array<{
 // 修法走 dts:6449 的 Slider Observable binding 分支（`value: Observable<number>`，
 // 无 onChanged）：useObservable 的 setValue 是**同步**跨 bridge 写 SwiftUI @State，
 // 连续手势不被 React 调度器拖慢。配合 useEffect([val]) 订阅写 Storage。
+
+// 按 slider 画像挑松开触感。A 强度档（span 大小）+ B 语义覆写（keyName 关键字）。
+// 双极 offset → softImpact（漂浮）；绝对尺寸（textSize/iconSize/minWidth/height）
+// → rigidImpact（刚硬）；其余按 span ≤20 light / ≤100 medium / >100 heavy 分级。
+function computeReleaseHaptic(
+  keyName: string,
+  min: number,
+  max: number
+): () => void {
+  const isBipolarOffset = /offset[XY]/.test(keyName) && min < 0
+  if (isBipolarOffset) return HapticFeedback.softImpact
+  if (/textSize|iconSize|minWidth|height/.test(keyName)) {
+    return HapticFeedback.rigidImpact
+  }
+  const span = max - min
+  if (span <= 20) return HapticFeedback.lightImpact
+  if (span <= 100) return HapticFeedback.mediumImpact
+  return HapticFeedback.heavyImpact
+}
+
 function TuneSlider({
   keyName,
   label,
@@ -1777,10 +1797,27 @@ function TuneSlider({
 }) {
   const valObs = useObservable<number>(() => readTune(keyName, def))
   const val = valObs.value
-  // 订阅 val 写 Storage。初次 mount 时会写一次同值，无副作用；之后每次
-  // SwiftUI Slider 手势引起 Observable 变化 → React 重渲染 → useEffect 命中。
+  // Haptic 画像 —— min/max/keyName 在生命周期内稳定，直接算不走 useMemo。
+  const releaseHaptic = computeReleaseHaptic(keyName, min, max)
+  const isBipolar = min < 0 && max > 0
+  // C 档检测用：记住上一个 val 判断"刚到边界 / 刚归零 / 刚回默认"。
+  const prevRef = useRef(val)
+  // resetTrigger 走 setValue(def) 时会顺带触发下面 val useEffect → 如果不屏蔽，
+  // 一次 reset 会让 sheet 里几十个 slider 同时响 softImpact("家感")形成震感雪崩。
+  // 用 flag 告诉 val useEffect：本次值变是 reset 触发的，跳过 C 档 haptic。
+  const resetInProgressRef = useRef(false)
+  // 订阅 val 写 Storage + C 档检测点 haptic。初次 mount prevRef === val 自然跳过。
   useEffect(() => {
     writeTune(keyName, val)
+    const prev = prevRef.current
+    if (val !== prev && !resetInProgressRef.current) {
+      if (val === min && prev > min) HapticFeedback.rigidImpact()
+      else if (val === max && prev < max) HapticFeedback.rigidImpact()
+      else if (isBipolar && val === 0 && prev !== 0) HapticFeedback.rigidImpact()
+      else if (val === def && prev !== def) HapticFeedback.softImpact()
+    }
+    resetInProgressRef.current = false
+    prevRef.current = val
   }, [val])
   // 2026-04-22 · resetTrigger 机制。parent 点「重置默认值」时 counter++，
   // 这里 useEffect 命中 → Observable 同步写 def → SwiftUI Slider 视觉回默认位。
@@ -1794,7 +1831,14 @@ function TuneSlider({
       mountedRef.current = true
       return
     }
+    resetInProgressRef.current = true
     valObs.setValue(def)
+    // 兜底：若 val 已等于 def，setValue 是 no-op，val useEffect 不会 fire 来清 flag。
+    // microtask 后兜底清一下，保证下一次真实交互首个 haptic 不被误吞。
+    const t = setTimeout(() => {
+      resetInProgressRef.current = false
+    }, 0)
+    return () => clearTimeout(t)
   }, [resetTrigger])
   return (
     <VStack alignment="leading" spacing={2}>
@@ -1815,6 +1859,10 @@ function TuneSlider({
         min={min}
         max={max}
         step={1}
+        onEditingChanged={(editing) => {
+          if (editing) HapticFeedback.selection()
+          else releaseHaptic()
+        }}
       />
     </VStack>
   )
@@ -1839,8 +1887,19 @@ function TuneToggle({
 }) {
   const valObs = useObservable<boolean>(() => readTuneBool(keyName, def))
   const val = valObs.value
+  // 翻转时 haptic：启用 = lightImpact（确认落定），关闭 = softImpact（软放下）。
+  // 初次 mount 和 resetTrigger 触发的变化都不响（避免一次 reset 多个 toggle 同时响）。
+  const hapticReadyRef = useRef(false)
+  const resetInProgressRef = useRef(false)
   useEffect(() => {
     writeTuneBool(keyName, val)
+    if (hapticReadyRef.current && !resetInProgressRef.current) {
+      if (val) HapticFeedback.lightImpact()
+      else HapticFeedback.softImpact()
+    } else {
+      hapticReadyRef.current = true
+    }
+    resetInProgressRef.current = false
   }, [val])
   const mountedRef = useRef(false)
   useEffect(() => {
@@ -1848,7 +1907,13 @@ function TuneToggle({
       mountedRef.current = true
       return
     }
+    resetInProgressRef.current = true
     valObs.setValue(def)
+    // 兜底：val 已等于 def 时 setValue 是 no-op，val useEffect 不会清 flag。
+    const t = setTimeout(() => {
+      resetInProgressRef.current = false
+    }, 0)
+    return () => clearTimeout(t)
   }, [resetTrigger])
   return (
     <Toggle title={label} value={valObs} />
@@ -1948,6 +2013,7 @@ function KeyboardTuneContent() {
           <Button
             role="destructive"
             action={() => {
+              HapticFeedback.notificationWarning()
               kbdSections.forEach((s) =>
                 s.params.forEach(([key, , , , def]) => writeTune(key, def))
               )
@@ -2021,6 +2087,7 @@ function DynamicIslandTuneContent() {
           <Button
             role="destructive"
             action={() => {
+              HapticFeedback.notificationWarning()
               diSections.forEach((s) =>
                 s.params.forEach(([key, , , , def]) => writeTune(key, def))
               )
@@ -2325,6 +2392,7 @@ function ExperimentsView() {
           <Button
             role="destructive"
             action={async () => {
+              HapticFeedback.notificationWarning()
               await cancelExperiment()
               setViewTick((t) => t + 1)
             }}
@@ -2625,13 +2693,13 @@ function MainView() {
     return (
       <List listStyle="insetGrouped" navigationTitle="高级选项">
         <Section title="调节">
-          <Button action={() => setPolishSheetOpen(true)}>
+          <Button action={() => { HapticFeedback.lightImpact(); setPolishSheetOpen(true) }}>
             <Label title="润色超时" systemImage="timer" />
           </Button>
-          <Button action={() => setKbdSheetOpen(true)}>
+          <Button action={() => { HapticFeedback.lightImpact(); setKbdSheetOpen(true) }}>
             <Label title="键盘调参" systemImage="keyboard" />
           </Button>
-          <Button action={() => setDiSheetOpen(true)}>
+          <Button action={() => { HapticFeedback.lightImpact(); setDiSheetOpen(true) }}>
             <Label title="灵动岛调参" systemImage="capsule.portrait" />
           </Button>
         </Section>
@@ -2644,7 +2712,7 @@ function MainView() {
             />
           </Button>
           {state !== "idle" ? (
-            <Button role="destructive" action={onEnd}>
+            <Button role="destructive" action={() => { HapticFeedback.notificationWarning(); onEnd() }}>
               <Label title="强制终止会话" systemImage="stop.circle" />
             </Button>
           ) : null}
@@ -2657,6 +2725,7 @@ function MainView() {
           <Button
             role="destructive"
             action={async () => {
+              HapticFeedback.notificationWarning()
               await resetToIdle()
               clearError()
               setTick((v) => v + 1)
@@ -2689,6 +2758,7 @@ function MainView() {
           <Button
             role="destructive"
             action={() => {
+              HapticFeedback.notificationWarning()
               clearLog()
               setTick((v) => v + 1)
             }}
@@ -2813,6 +2883,7 @@ function MainView() {
             </Picker>
             <Button
               action={async () => {
+                HapticFeedback.notificationSuccess()
                 const ok = await startWarmSession(
                   warmPickMinutes * 60 * 1000
                 )
@@ -2845,6 +2916,7 @@ function MainView() {
             <Button
               role="destructive"
               action={async () => {
+                HapticFeedback.notificationWarning()
                 await stopWarmSession("user early stop")
                 setTick((t) => t + 1)
               }}
@@ -2913,6 +2985,7 @@ function MainView() {
             <Button
               role="destructive"
               action={() => {
+                HapticFeedback.notificationWarning()
                 clearError()
                 clearErrorKind()
                 setTick((v) => v + 1)
@@ -2947,14 +3020,14 @@ function MainView() {
                   ) : null}
                 </VStack>
                 <Spacer />
-                <Button action={() => debugPlayback(filePath)}>
+                <Button action={() => { HapticFeedback.lightImpact(); debugPlayback(filePath) }}>
                   <Image
                     systemName="play.circle.fill"
                     font="title2"
                     foregroundStyle="systemBlue"
                   />
                 </Button>
-                <Button action={debugPlaybackPause}>
+                <Button action={() => { HapticFeedback.lightImpact(); debugPlaybackPause() }}>
                   <Image
                     systemName="pause.circle"
                     font="title2"
