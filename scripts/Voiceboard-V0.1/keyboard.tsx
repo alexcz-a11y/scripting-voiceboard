@@ -408,7 +408,12 @@ function VoiceboardKeyboard() {
     try {
       CustomKeyboard.insertText(payload)
       log("insertText OK")
-      HapticFeedback.notificationSuccess()
+      // iOS 键盘扩展里 HapticFeedback.notificationSuccess() 真机不响
+      // (主 app 同家族 API 正常; Impact 家族 softImpact 在键盘扩展可用),
+      // 降级 3×heavyImpact 70ms 间隔模拟成功三连
+      HapticFeedback.heavyImpact()
+      setTimeout(() => HapticFeedback.heavyImpact(), 70)
+      setTimeout(() => HapticFeedback.heavyImpact(), 140)
     } catch (e) {
       logErr("insertText threw:", String(e))
     }
