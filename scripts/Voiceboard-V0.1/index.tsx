@@ -1671,6 +1671,46 @@ const TUNE_SECTIONS: Array<{
       ["mic.offsetY",     "上下移动",     -40,  40,   0],
     ],
   },
+  // ---------- Stage 6b v4.2 · 灵动岛（Dynamic Island）3 节 ----------
+  //
+  // v4.2 真机二次反馈：主文案从 Center region 移到 Trailing region，
+  // 因为 Center 居中会挤占 Leading 图标视觉位置。Trailing wrap 到 pill
+  // 下方右半，自然"下方中心偏右"。新增 offsetX/Y 让用户微调文案位置。
+  //
+  // 视觉参数热调，键名前缀 `di.*`，`live_activity.tsx` builder 每次 iOS update
+  // 重读 Storage → 改参数 ≤1s（受 LA 1000ms 节流）生效。
+  // LockScreenContent 留给 Step 3，本节不暴露其参数。
+  {
+    title: "灵动岛 · 紧凑态 + 最小",
+    params: [
+      ["di.cl.iconSize",   "紧凑左 图标大小",      10, 22, 14],
+      ["di.cl.textSize",   "紧凑左 时码大小",      10, 18, 12],
+      ["di.cl.innerGap",   "紧凑左 图标文字距离",   0, 12,  4],
+      ["di.cl.padH",       "紧凑左 左右空隙",       0, 20,  6],
+      ["di.cl.padV",       "紧凑左 上下空隙",       0, 16,  2],
+      ["di.min.iconSize",  "最小态 图标大小",      10, 24, 16],
+    ],
+  },
+  {
+    title: "灵动岛 · 展开左（VOICEBOARD + 图标）",
+    params: [
+      ["di.el.iconSize",     "图标 大小",            14, 80,   56],
+      ["di.el.brandIconGap", "品牌字↔图标 距离",      0, 16,    4],
+      ["di.brand.textSize",  "VOICEBOARD 字号",       8, 18,   11],
+      ["di.el.offsetX",      "左右移动",           -120,120,   17],
+      ["di.el.offsetY",      "上下移动",            -80, 80,    0],
+    ],
+  },
+  {
+    title: "灵动岛 · 展开右（主文案 · 首字左对齐）",
+    params: [
+      ["di.et.headlineSize", "主文字 大小",          12, 24,   19],
+      ["di.et.captionSize",  "副文字 大小",           9, 18,   13],
+      ["di.et.rowSpacing",   "主副文字 距离",         0, 10,    3],
+      ["di.et.offsetX",      "左右移动",           -180,120, -154],
+      ["di.et.offsetY",      "上下移动",            -80, 80,   -2],
+    ],
+  },
 ]
 
 // Stage 6a Phase C — 布尔开关（Toggle）配置。独立于 TUNE_SECTIONS，因为
@@ -1686,6 +1726,15 @@ const TUNE_BOOL_SECTIONS: Array<{
     params: [
       ["kbd.hasDictation",   "显示系统麦克风键",    true],
       ["kbd.toolbarVisible", "显示键盘顶部工具栏",  false],
+    ],
+  },
+  // ---------- Stage 6b v4.1 · 灵动岛 · 显隐开关 ----------
+  // brandVisible: Leading 顶部 "VOICEBOARD" 品牌字 显隐
+  // (v4.1 去掉 cards.visible: 真机上圆角半透白卡片不渲染，已回到裸布局)
+  {
+    title: "灵动岛 · 显隐开关",
+    params: [
+      ["di.brand.visible",  "显示 VOICEBOARD 品牌字",  true],
     ],
   },
 ]
