@@ -2009,52 +2009,51 @@ function DynamicIslandTuneView() {
 }
 
 function LogView() {
-  const [viewTick, setViewTick] = useState(0)
-  useEffect(() => {
-    let cancelled = false
-    const poll = () => {
-      if (cancelled) return
-      setViewTick((v) => v + 1)
-      setTimeout(poll, 800)
-    }
-    const h = setTimeout(poll, 800)
-    return () => {
-      cancelled = true
-      clearTimeout(h)
-    }
-  }, [])
-  void viewTick
-
+  // 纯静态显示 · 无 hooks。
+  //
+  // 诊断结论:Scripting NavigationLink destination 子页的 useEffect cleanup
+  // 会在 mount 后约 1s 自动触发(MainView 400ms 轮询 setTick 驱动的连锁反应),
+  // 把本子页的所有 hooks / 事件回调死锁 —— UI 仍显示但不响应任何 tap。
+  // 终端日志可见:render #1 → List onAppear → useEffect mount → 1 秒后 cleanup
+  // (pollCount=0 = poll 都没来得及跑),此后任何按钮/onTapGesture 都无效。
+  //
+  // 修法:LogView 彻底不要 hooks,按钮挪去 AdvancedView(MainView 直接子层,
+  // 生命周期正常)。本子页只做一次性渲染,用户退回再进 = 最新状态。
   const entries = readLog()
-  const recent = entries.slice(-200)
-  const recentText = formatLog(recent)
+  const recent = entries.slice(-50).reverse()
 
   return (
     <List listStyle="insetGrouped" navigationTitle="日志">
-      <Section>
-        <Button
-          action={async () => {
-            const all = formatLog(readLog())
-            await Pasteboard.setString(all)
-            vblog("index", "log copied to pasteboard ·", all.length, "chars")
-          }}
-        >
-          <Label title="复制全部" systemImage="doc.on.doc" />
-        </Button>
-        <Button
-          role="destructive"
-          action={() => {
-            clearLog()
-            setViewTick((v) => v + 1)
-          }}
-        >
-          <Label title="清空" systemImage="trash" />
-        </Button>
-      </Section>
-      <Section title={`最近 ${entries.length} 条`}>
-        <Text font="footnote">
-          {recentText.length > 0 ? recentText : "(空)"}
+      <Section
+        footer={
+          <Text font="caption" foregroundStyle="secondaryLabel">
+            复制/清空按钮在上一层「高级选项」。退回再进可查看最新日志。
+          </Text>
+        }
+      >
+        <Text font="footnote" foregroundStyle="secondaryLabel">
+          共 {entries.length} 条 · 显示最新 {recent.length}
         </Text>
+      </Section>
+      <Section>
+        {recent.length === 0 ? (
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            (空)
+          </Text>
+        ) : (
+          recent.map((e, i) => {
+            const d = new Date(e.ts)
+            const hh = String(d.getHours()).padStart(2, "0")
+            const mm = String(d.getMinutes()).padStart(2, "0")
+            const ss = String(d.getSeconds()).padStart(2, "0")
+            const msg = e.msg.length > 400 ? e.msg.slice(0, 400) + "…" : e.msg
+            return (
+              <Text key={`${e.ts}-${i}`} font="footnote">
+                {`${hh}:${mm}:${ss} [${e.src}] ${msg}`}
+              </Text>
+            )
+          })
+        )}
       </Section>
     </List>
   )
@@ -2607,6 +2606,25 @@ function MainView() {
               systemImage="doc.text"
             />
           </NavigationLink>
+          <Button
+            action={async () => {
+              const all = formatLog(readLog())
+              await Pasteboard.setString(all)
+              vblog("index", "log copied to pasteboard ·", all.length, "chars")
+              setTick((v) => v + 1)
+            }}
+          >
+            <Label title="复制全部日志" systemImage="doc.on.doc" />
+          </Button>
+          <Button
+            role="destructive"
+            action={() => {
+              clearLog()
+              setTick((v) => v + 1)
+            }}
+          >
+            <Label title="清空日志" systemImage="trash" />
+          </Button>
           <NavigationLink destination={<DebugInfoView />}>
             <Label title="调试信息" systemImage="ladybug" />
           </NavigationLink>
