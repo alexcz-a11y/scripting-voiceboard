@@ -1694,19 +1694,21 @@ const TUNE_SECTIONS: Array<{
   {
     title: "灵动岛 · 展开左（VOICEBOARD + 图标）",
     params: [
-      ["di.el.iconSize",     "图标 大小",            14, 80, 56],
-      ["di.el.brandIconGap", "品牌字↔图标 距离",      0, 16,  4],
-      ["di.brand.textSize",  "VOICEBOARD 字号",       8, 18, 11],
+      ["di.el.iconSize",     "图标 大小",            14, 80,  56],
+      ["di.el.brandIconGap", "品牌字↔图标 距离",      0, 16,   4],
+      ["di.brand.textSize",  "VOICEBOARD 字号",       8, 18,  11],
+      ["di.el.offsetX",      "左右移动",           -120,120,   0],
+      ["di.el.offsetY",      "上下移动",            -80, 80,   0],
     ],
   },
   {
-    title: "灵动岛 · 展开右（主文案 · 下方偏右）",
+    title: "灵动岛 · 展开右（主文案 · 首字左对齐）",
     params: [
-      ["di.et.headlineSize", "主文字 大小",         12, 24, 17],
-      ["di.et.captionSize",  "副文字 大小",          9, 18, 12],
-      ["di.et.rowSpacing",   "主副文字 距离",        0, 10,  3],
-      ["di.et.offsetX",      "左右移动",           -60, 30,  0],
-      ["di.et.offsetY",      "上下移动",           -40, 40,  0],
+      ["di.et.headlineSize", "主文字 大小",          12, 24,  17],
+      ["di.et.captionSize",  "副文字 大小",           9, 18,  12],
+      ["di.et.rowSpacing",   "主副文字 距离",         0, 10,   3],
+      ["di.et.offsetX",      "左右移动",           -180,120,   0],
+      ["di.et.offsetY",      "上下移动",            -80, 80,   0],
     ],
   },
 ]

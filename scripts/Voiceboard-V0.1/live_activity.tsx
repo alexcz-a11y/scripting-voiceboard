@@ -182,6 +182,8 @@ function readDiTune() {
     // ----- Expanded Leading (pill 左侧 + 下方): VOICEBOARD + 大图标 -----
     elIconSize:     readTune("di.el.iconSize",   56),
     elBrandIconGap: readTune("di.el.brandIconGap",4),
+    elOffsetX:      readTune("di.el.offsetX",     0),  // 正值往右 / 负值往左
+    elOffsetY:      readTune("di.el.offsetY",     0),  // 正值往下 / 负值往上
     // ----- Expanded Trailing (pill 右侧 + 下方 wrap): 主文案 headline + caption -----
     etHeadlineSize: readTune("di.et.headlineSize",17),
     etCaptionSize:  readTune("di.et.captionSize",12),
@@ -274,14 +276,19 @@ function Minimal(state: VBActivityState) {
   )
 }
 
-// v4.1: DI 展开态左侧（pill 左侧窄列）—— VOICEBOARD 品牌字 + 大图标 竖排。
+// v4.2: DI 展开态左侧（pill 左侧 + 下方）—— VOICEBOARD 品牌字 + 大图标 竖排。
 // 无卡片背景（真机不渲染，回到 SwiftUI 默认布局）。
+// offset 让用户微调整体位置。
 function ExpandedLeading(state: VBActivityState) {
   const tune = readDiTune()
   const bools = readDiTuneBool()
   const color = statusBrandColor(state.status)
   return (
-    <VStack alignment="center" spacing={tune.elBrandIconGap}>
+    <VStack
+      alignment="center"
+      spacing={tune.elBrandIconGap}
+      offset={{ x: tune.elOffsetX, y: tune.elOffsetY }}
+    >
       {bools.brandVisible ? (
         <Text
           font={tune.brandTextSize}
@@ -305,20 +312,21 @@ function ExpandedLeading(state: VBActivityState) {
 // v4.2: DI 展开态右侧（pill 右侧 + 下方 wrap）—— 主文案 headline + caption。
 //
 // 布局策略：
-//   VStack alignment="trailing"
+//   VStack alignment="leading"   ← 两行首字左侧垂直对齐
 //     ├ Spacer          (把内容推到 region 底部，避开 pill 高度)
 //     ├ Text headline   (主状态文字, 状态色 bold)
 //     └ Text caption    (mono 时码/模型/重试提示, secondaryLabel)
 //   offset={{ x: etOffsetX, y: etOffsetY }}  (用户微调左右/上下)
 //
 // 效果: 文案显示在 pill 右侧 wrap 下来的区域（视觉上在"下方中心偏右"），
-// 不与 Leading 的 VOICEBOARD + 图标视觉重叠。
+// 两行文字的**首字左边垂直对齐**（而非右对齐），不与 Leading 的
+// VOICEBOARD + 图标视觉重叠。
 function ExpandedTrailing(state: VBActivityState) {
   const tune = readDiTune()
   const color = statusBrandColor(state.status)
   return (
     <VStack
-      alignment="trailing"
+      alignment="leading"
       spacing={tune.etRowSpacing}
       offset={{ x: tune.etOffsetX, y: tune.etOffsetY }}
     >
