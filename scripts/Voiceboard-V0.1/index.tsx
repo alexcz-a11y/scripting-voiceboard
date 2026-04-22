@@ -1,13 +1,20 @@
 import {
   Button,
   HStack,
+  Image,
+  Label,
+  List,
   LiveActivity,
   Navigation,
+  NavigationLink,
   NavigationStack,
   Path,
+  Picker,
+  ProgressView,
   Script,
   ScrollView,
   SecureField,
+  Section,
   Slider,
   Spacer,
   Text,
@@ -1966,36 +1973,72 @@ function MainView() {
     Script.exit()
   }
 
-  const statusLabel =
-    state === "warm"
-      ? `warm · 保持中 · 剩余 ${warmRemainingMMSS}`
-      : state === "armed" && recordingSec !== null
-      ? `armed · 录音中 ${recordingSec}s`
-      : state === "transcribing"
-      ? "transcribing · 转录中…"
-      : state === "polishing"
-      ? "polishing · 润色中…"
-      : state === "done" && finalDurSec !== null
-      ? `done · 时长 ${finalDurSec}s（等待键盘插入）`
-      : state
-
   const statusColor:
     | "orange"
     | "systemGreen"
     | "systemRed"
     | "systemBlue"
+    | "systemIndigo"
+    | "secondaryLabel"
     | "label" =
     err !== null
       ? "systemRed"
       : state === "warm"
       ? "systemBlue"
       : state === "armed"
-      ? "orange"
+      ? "systemRed"
       : state === "transcribing" || state === "polishing"
-      ? "systemBlue"
+      ? "systemIndigo"
       : state === "done"
       ? "systemGreen"
-      : "label"
+      : "secondaryLabel"
+
+  // Stage 7 — StatusHero 用的 SF Symbol + 简短标题 + 副标题三件套。
+  // 与 statusColor 对齐：同一 state 的图标/色/文字都是一套视觉语言。
+  const statusIcon =
+    err !== null
+      ? "exclamationmark.triangle.fill"
+      : state === "warm"
+      ? "waveform.badge.mic"
+      : state === "armed"
+      ? "mic.fill"
+      : state === "transcribing"
+      ? "waveform"
+      : state === "polishing"
+      ? "sparkles"
+      : state === "done"
+      ? "checkmark.circle.fill"
+      : "moon.zzz"
+
+  const statusHeadline =
+    err !== null
+      ? "错误"
+      : state === "warm"
+      ? "保持中"
+      : state === "armed"
+      ? "录音中"
+      : state === "transcribing"
+      ? "转录中"
+      : state === "polishing"
+      ? "润色中"
+      : state === "done"
+      ? "已完成"
+      : "空闲"
+
+  const statusCaption =
+    err !== null
+      ? errKind ?? "未知错误"
+      : state === "warm"
+      ? `剩余 ${warmRemainingMMSS}`
+      : state === "armed" && recordingSec !== null
+      ? `已录 ${recordingSec}s`
+      : state === "transcribing"
+      ? "Scribe v2 · ElevenLabs"
+      : state === "polishing"
+      ? "gpt-5.4-mini · OpenAI"
+      : state === "done" && finalDurSec !== null
+      ? `时长 ${finalDurSec}s · 等待键盘插入`
+      : "点下方「激活保持」开始"
 
   const scribeKeySet = (readScribeKey() ?? "").length > 0
   const openAIKeySet = (readOpenAIKey() ?? "").length > 0
@@ -2012,511 +2055,761 @@ function MainView() {
     return parts.join(" · ")
   })()
 
+  // Stage 7 R3 — AdvancedView 精简为"入口列表 + 6 孙子页"。
+  // 每个孙子页惰性挂载（NavigationLink destination），只在用户 push 进去时 mount。
+  // 所有孙子页都是 nested function，闭包共享 MainView 的 state / 派生值 / 模块级业务函数。
+
+  function PolishTimeoutView() {
+    return (
+      <List listStyle="insetGrouped" navigationTitle="润色超时">
+        <Section
+          header={
+            <Text font="caption" foregroundStyle="secondaryLabel">
+              当前 {polishTimeoutPick}s
+            </Text>
+          }
+          footer={
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              网速慢 / 海外 / 蜂窝网络建议 30s+；超时后会降级插入未润色原文。
+            </Text>
+          }
+        >
+          <Picker
+            title="polish timeout"
+            pickerStyle="segmented"
+            value={polishTimeoutPick}
+            onChanged={(v) => {
+              writePolishTimeoutSec(v as number)
+              setPolishTimeoutPick(v as number)
+              setTick((t) => t + 1)
+            }}
+          >
+            <Text tag={10}>10s</Text>
+            <Text tag={20}>20s</Text>
+            <Text tag={30}>30s</Text>
+            <Text tag={60}>60s</Text>
+          </Picker>
+        </Section>
+      </List>
+    )
+  }
+
+  function KeyboardTuneView() {
+    const KBD_TITLES = new Set([
+      "键盘整体",
+      "顶行布局",
+      "状态标签（左上）",
+      "右上时码",
+      "模式条（口述/自动/翻译）",
+      "主胶囊麦克风",
+    ])
+    const kbdSections = TUNE_SECTIONS.filter((s) => KBD_TITLES.has(s.title))
+    const kbdBoolSections = TUNE_BOOL_SECTIONS.filter(
+      (s) => s.title === "系统键盘层（iOS 原生）"
+    )
+    return (
+      <List listStyle="insetGrouped" navigationTitle="键盘调参">
+        <Section
+          footer={
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              拖动 → 写 Storage → 键盘 ≤400ms 同步生效。带蓝色数值 = 已偏离默认。
+            </Text>
+          }
+        >
+          <Button
+            role="destructive"
+            action={() => {
+              kbdSections.forEach((s) =>
+                s.params.forEach(([key, , , , def]) => writeTune(key, def))
+              )
+              kbdBoolSections.forEach((s) =>
+                s.params.forEach(([key, , def]) => writeTuneBool(key, def))
+              )
+              setTuneResetCounter((c) => c + 1)
+              log("keyboard tune reset to defaults")
+            }}
+          >
+            <Label
+              title="重置键盘默认值"
+              systemImage="arrow.counterclockwise"
+            />
+          </Button>
+        </Section>
+        {kbdSections.map((section) => (
+          <Section key={section.title} title={section.title}>
+            {section.params.map(([keyName, label, min, max, def]) => (
+              <TuneSlider
+                key={`${keyName}-${tuneResetCounter}`}
+                keyName={keyName}
+                label={label}
+                min={min}
+                max={max}
+                def={def}
+              />
+            ))}
+          </Section>
+        ))}
+        {kbdBoolSections.map((section) => (
+          <Section key={section.title} title={section.title}>
+            {section.params.map(([keyName, label, def]) => (
+              <TuneToggle
+                key={`${keyName}-${tuneResetCounter}`}
+                keyName={keyName}
+                label={label}
+                def={def}
+              />
+            ))}
+          </Section>
+        ))}
+      </List>
+    )
+  }
+
+  function DynamicIslandTuneView() {
+    const DI_TITLES = new Set([
+      "灵动岛 · 紧凑态 + 最小",
+      "灵动岛 · 展开左（VOICEBOARD + 图标）",
+      "灵动岛 · 展开右（主文案 · 首字左对齐）",
+    ])
+    const diSections = TUNE_SECTIONS.filter((s) => DI_TITLES.has(s.title))
+    const diBoolSections = TUNE_BOOL_SECTIONS.filter(
+      (s) => s.title === "灵动岛 · 显隐开关"
+    )
+    return (
+      <List listStyle="insetGrouped" navigationTitle="灵动岛调参">
+        <Section
+          footer={
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              拖动 → 写 Storage → Live Activity ≤1s 同步生效。
+            </Text>
+          }
+        >
+          <Button
+            role="destructive"
+            action={() => {
+              diSections.forEach((s) =>
+                s.params.forEach(([key, , , , def]) => writeTune(key, def))
+              )
+              diBoolSections.forEach((s) =>
+                s.params.forEach(([key, , def]) => writeTuneBool(key, def))
+              )
+              setTuneResetCounter((c) => c + 1)
+              log("dynamic island tune reset to defaults")
+            }}
+          >
+            <Label
+              title="重置灵动岛默认值"
+              systemImage="arrow.counterclockwise"
+            />
+          </Button>
+        </Section>
+        {diSections.map((section) => (
+          <Section key={section.title} title={section.title}>
+            {section.params.map(([keyName, label, min, max, def]) => (
+              <TuneSlider
+                key={`${keyName}-${tuneResetCounter}`}
+                keyName={keyName}
+                label={label}
+                min={min}
+                max={max}
+                def={def}
+              />
+            ))}
+          </Section>
+        ))}
+        {diBoolSections.map((section) => (
+          <Section key={section.title} title={section.title}>
+            {section.params.map(([keyName, label, def]) => (
+              <TuneToggle
+                key={`${keyName}-${tuneResetCounter}`}
+                keyName={keyName}
+                label={label}
+                def={def}
+              />
+            ))}
+          </Section>
+        ))}
+      </List>
+    )
+  }
+
+  function LogView() {
+    return (
+      <List listStyle="insetGrouped" navigationTitle="日志">
+        <Section>
+          <Button
+            action={async () => {
+              const all = formatLog(readLog())
+              await Pasteboard.setString(all)
+              log("log copied to pasteboard ·", all.length, "chars")
+              setTick((v) => v + 1)
+            }}
+          >
+            <Label title="复制全部" systemImage="doc.on.doc" />
+          </Button>
+          <Button
+            role="destructive"
+            action={() => {
+              clearLog()
+              setTick((v) => v + 1)
+            }}
+          >
+            <Label title="清空" systemImage="trash" />
+          </Button>
+        </Section>
+        <Section title={`最近 ${logEntries.length} 条`}>
+          <Text font="footnote">
+            {recentLogText.length > 0 ? recentLogText : "(空)"}
+          </Text>
+        </Section>
+      </List>
+    )
+  }
+
+  function DebugInfoView() {
+    return (
+      <List listStyle="insetGrouped" navigationTitle="调试信息">
+        {latencyLine !== null ? (
+          <Section title="链路耗时">
+            <Text font="footnote" foregroundStyle="systemBlue">
+              {latencyLine}
+            </Text>
+          </Section>
+        ) : null}
+        <Section title="运行时">
+          <HStack>
+            <Text font="footnote">BackgroundKeeper.isActive</Text>
+            <Spacer />
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              {bgActive === null ? "…" : String(bgActive)}
+            </Text>
+          </HStack>
+          <HStack>
+            <Text font="footnote">sessionActive</Text>
+            <Spacer />
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              {String(sessionActive)}
+            </Text>
+          </HStack>
+          <HStack>
+            <Text font="footnote">recorder</Text>
+            <Spacer />
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              {recorder !== null ? "running" : "—"}
+            </Text>
+          </HStack>
+          <HStack>
+            <Text font="footnote">silentKeeper</Text>
+            <Spacer />
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              {silentKeeper !== null ? "running" : "—"}
+            </Text>
+          </HStack>
+          <HStack>
+            <Text font="footnote">heartbeat</Text>
+            <Spacer />
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              {heartbeatAgo}s ago
+            </Text>
+          </HStack>
+          <HStack>
+            <Text font="footnote">Script.name</Text>
+            <Spacer />
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              {Script.name}
+            </Text>
+          </HStack>
+          <HStack>
+            <Text font="footnote">tick</Text>
+            <Spacer />
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              {tick}
+            </Text>
+          </HStack>
+          <HStack>
+            <Text font="footnote">lastRecorderError</Text>
+            <Spacer />
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              {lastRecorderError ?? "—"}
+            </Text>
+          </HStack>
+        </Section>
+        <Section title="queryParameters">
+          <Text font="footnote" foregroundStyle="secondaryLabel">
+            {qpStr}
+          </Text>
+        </Section>
+      </List>
+    )
+  }
+
+  function ExperimentsView() {
+    const labelFor = (id: ExperimentId): string =>
+      id === "A1"
+        ? "A1 · 裸 keepAlive"
+        : id === "A2"
+        ? "A2 · keepAlive + Live Activity"
+        : id === "A3"
+        ? "A3 · keepAlive + 静音录音"
+        : "A4 · keepAlive + LA + 静音录音"
+    const iconFor = (id: ExperimentId): string =>
+      id === "A1"
+        ? "1.circle"
+        : id === "A2"
+        ? "2.circle"
+        : id === "A3"
+        ? "3.circle"
+        : "4.circle"
+    return (
+      <List
+        listStyle="insetGrouped"
+        navigationTitle="保活机制实测"
+      >
+        <Section
+          header={
+            <Text font="caption" foregroundStyle="secondaryLabel">
+              历史结果
+            </Text>
+          }
+          footer={
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              4.5a 实验（不影响正常录音链路）。运行前请确保主流程不在 warm/armed 态。
+            </Text>
+          }
+        >
+          {(["A1", "A2", "A3", "A4"] as ExperimentId[]).map((id) => {
+            const r = expResults[id]
+            const result =
+              r === undefined
+                ? "—"
+                : r.firstHeartbeatAt === 0
+                ? `error at ${((r.endedAt - r.startedAt) / 1000).toFixed(1)}s`
+                : `存活 ${(
+                    (r.lastHeartbeatAt - r.firstHeartbeatAt) /
+                    1000
+                  ).toFixed(1)}s · ${r.cause}`
+            return (
+              <HStack key={`result-${id}`}>
+                <Text font="footnote">{labelFor(id)}</Text>
+                <Spacer />
+                <Text
+                  font="footnote"
+                  foregroundStyle={
+                    r === undefined ? "secondaryLabel" : "systemBlue"
+                  }
+                >
+                  {result}
+                </Text>
+              </HStack>
+            )
+          })}
+        </Section>
+        {expRunning !== null ? (
+          <Section title="运行中">
+            <HStack>
+              <Image systemName="hourglass" foregroundStyle="orange" />
+              <Text font="footnote" foregroundStyle="orange">
+                {expRunning} · 剩余{" "}
+                {Math.max(0, Math.floor((expEndAt - Date.now()) / 1000))}
+                s
+              </Text>
+              <Spacer />
+            </HStack>
+            <Button
+              role="destructive"
+              action={async () => {
+                await cancelExperiment()
+                setTick((t) => t + 1)
+              }}
+            >
+              <Label title="提前结束" systemImage="stop.circle" />
+            </Button>
+          </Section>
+        ) : null}
+        <Section title="运行实验">
+          {(["A1", "A2", "A3", "A4"] as ExperimentId[]).map((id) => (
+            <Button
+              key={`run-${id}`}
+              action={() => {
+                if (expRunning !== null || sessionActive) {
+                  log(`${id} tap ignored · busy`)
+                  return
+                }
+                runExperiment(id)
+                setTick((t) => t + 1)
+              }}
+            >
+              <Label title={labelFor(id)} systemImage={iconFor(id)} />
+            </Button>
+          ))}
+        </Section>
+        <Section
+          header={
+            <Text font="caption" foregroundStyle="secondaryLabel">
+              onResume 路径
+            </Text>
+          }
+          footer={
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              点拷贝 URL，切到备忘录粘贴并点击链接，应看到日志新增 "onResume fired" 且没有 "script run · env="。
+            </Text>
+          }
+        >
+          <Button
+            action={async () => {
+              const url = `scripting://run/${encodeURIComponent(
+                Script.name
+              )}?probe=1`
+              await Pasteboard.setString(url)
+              log("onResume probe URL copied:", url)
+              setTick((t) => t + 1)
+            }}
+          >
+            <Label title="拷贝 probe URL" systemImage="link" />
+          </Button>
+        </Section>
+      </List>
+    )
+  }
+
+  function AdvancedView() {
+    return (
+      <List listStyle="insetGrouped" navigationTitle="高级选项">
+        <Section title="调节">
+          <NavigationLink destination={<PolishTimeoutView />}>
+            <Label title="润色超时" systemImage="timer" />
+          </NavigationLink>
+          <NavigationLink destination={<KeyboardTuneView />}>
+            <Label title="键盘调参" systemImage="keyboard" />
+          </NavigationLink>
+          <NavigationLink destination={<DynamicIslandTuneView />}>
+            <Label title="灵动岛调参" systemImage="capsule.portrait" />
+          </NavigationLink>
+        </Section>
+
+        <Section title="操作">
+          <Button action={startSession}>
+            <Label
+              title="开启录音会话（前台）"
+              systemImage="mic.circle"
+            />
+          </Button>
+          {state !== "idle" ? (
+            <Button role="destructive" action={onEnd}>
+              <Label title="强制终止会话" systemImage="stop.circle" />
+            </Button>
+          ) : null}
+          <Button action={foregroundTestRecord}>
+            <Label
+              title="前台测试录音 2 秒"
+              systemImage="timelapse"
+            />
+          </Button>
+          <Button
+            role="destructive"
+            action={async () => {
+              await resetToIdle()
+              clearError()
+              setTick((v) => v + 1)
+            }}
+          >
+            <Label
+              title="清除状态（重置到 idle）"
+              systemImage="arrow.counterclockwise"
+            />
+          </Button>
+        </Section>
+
+        <Section title="诊断">
+          <NavigationLink destination={<LogView />}>
+            <Label
+              title={`日志 (${logEntries.length})`}
+              systemImage="doc.text"
+            />
+          </NavigationLink>
+          <NavigationLink destination={<DebugInfoView />}>
+            <Label title="调试信息" systemImage="ladybug" />
+          </NavigationLink>
+        </Section>
+
+        <Section title="实验">
+          <NavigationLink destination={<ExperimentsView />}>
+            <Label
+              title="4.5a 保活机制实测"
+              systemImage="flask"
+            />
+          </NavigationLink>
+        </Section>
+      </List>
+    )
+  }
+
   return (
     <NavigationStack>
-      <ScrollView
+      <List
+        listStyle="insetGrouped"
         navigationTitle="Voiceboard"
         navigationBarTitleDisplayMode="inline"
       >
-        <VStack spacing={16} padding={20} alignment="leading">
-          {q.action === "arm" && state !== "idle" ? (
-            <Text font="footnote" foregroundStyle="orange">
-              已从键盘唤起 · 请切回刚才输入文字的 App 继续录音
-            </Text>
-          ) : null}
+        {q.action === "arm" && state !== "idle" ? (
+          <Section>
+            <Label
+              title="已从键盘唤起 · 请切回刚才输入文字的 App 继续录音"
+              systemImage="keyboard.chevron.compact.down"
+            />
+          </Section>
+        ) : null}
 
-          <VStack spacing={6} alignment="leading">
+        {/* Stage 7 — StatusHero · 大图标 + 标题 + 副标题 + 条件 ProgressView */}
+        <Section>
+          <HStack spacing={14}>
+            <Image
+              systemName={statusIcon}
+              font="largeTitle"
+              foregroundStyle={statusColor}
+            />
+            <VStack alignment="leading" spacing={2}>
+              <Text
+                font="title2"
+                fontWeight="semibold"
+                foregroundStyle={statusColor}
+              >
+                {statusHeadline}
+              </Text>
+              <Text font="footnote" foregroundStyle="secondaryLabel">
+                {statusCaption}
+              </Text>
+            </VStack>
+            <Spacer />
+          </HStack>
+          {state === "warm" && warmUntil !== null ? (
+            <ProgressView
+              progressViewStyle="linear"
+              timerFrom={new Date()}
+              timerTo={new Date(warmUntil)}
+              countsDown
+            />
+          ) : null}
+          {state === "transcribing" || state === "polishing" ? (
+            <ProgressView progressViewStyle="circular" />
+          ) : null}
+        </Section>
+
+        {/* Stage 4.5b — 保持麦克风（warm 会话面板） · Picker menu 下拉 */}
+        {state === "idle" ? (
+          <Section
+            header={
+              <Text font="caption" foregroundStyle="secondaryLabel">
+                保持麦克风
+              </Text>
+            }
+            footer={
+              <Text font="footnote" foregroundStyle="secondaryLabel">
+                激活后 Scripting 会在后台保持麦克风就绪；在选定时长内，
+                你在任意 App 点键盘的录音按钮都可以直接录音。
+              </Text>
+            }
+          >
+            <Picker
+              title="保持时长"
+              pickerStyle="menu"
+              value={warmPickMinutes}
+              onChanged={(v) => {
+                setWarmPickMinutes(v as number)
+                setTick((t) => t + 1)
+              }}
+            >
+              <Text tag={1}>1 分钟</Text>
+              <Text tag={3}>3 分钟</Text>
+              <Text tag={5}>5 分钟</Text>
+              <Text tag={15}>15 分钟</Text>
+              <Text tag={30}>30 分钟</Text>
+              <Text tag={60}>60 分钟</Text>
+            </Picker>
+            <Button
+              action={async () => {
+                const ok = await startWarmSession(
+                  warmPickMinutes * 60 * 1000
+                )
+                log("startWarmSession tap result:", ok)
+                setTick((t) => t + 1)
+              }}
+            >
+              <Label
+                title={`激活保持 ${warmPickMinutes} 分钟`}
+                systemImage="waveform.badge.mic"
+              />
+            </Button>
+          </Section>
+        ) : null}
+
+        {state === "warm" ? (
+          <Section
+            header={
+              <Text font="caption" foregroundStyle="secondaryLabel">
+                保持麦克风
+              </Text>
+            }
+            footer={
+              <Text font="footnote" foregroundStyle="secondaryLabel">
+                切到任意 App，点键盘 🎙 录音 即可直接录音；
+                完成后自动回到保持态等待下一次。
+              </Text>
+            }
+          >
+            <Button
+              role="destructive"
+              action={async () => {
+                await stopWarmSession("user early stop")
+                setTick((t) => t + 1)
+              }}
+            >
+              <Label title="提前结束" systemImage="xmark.circle.fill" />
+            </Button>
+          </Section>
+        ) : null}
+
+        {state === "armed" ? (
+          <Section>
+            <Label
+              title="切到任意 App，唤出 Scripting 键盘，点麦克风即停止并插入"
+              systemImage="arrow.uturn.forward.circle"
+            />
+          </Section>
+        ) : null}
+
+        <Section
+          header={
             <Text font="caption" foregroundStyle="secondaryLabel">
-              ⚙ Keys
+              密钥
             </Text>
-            <SecureField
-              title="ElevenLabs Scribe Key"
-              prompt="xi-api-key"
-              value={scribeKeyDraft}
-              onChanged={(v) => {
-                setScribeKeyDraft(v)
-                if (v.length > 0) writeScribeKey(v)
-                else clearScribeKey()
-                setTick((t) => t + 1)
-              }}
-            />
-            <SecureField
-              title="OpenAI Key"
-              prompt="sk-..."
-              value={openAIKeyDraft}
-              onChanged={(v) => {
-                setOpenAIKeyDraft(v)
-                if (v.length > 0) writeOpenAIKey(v)
-                else clearOpenAIKey()
-                setTick((t) => t + 1)
-              }}
-            />
+          }
+          footer={
             <Text font="footnote" foregroundStyle="secondaryLabel">
               scribe {scribeKeySet ? "✓" : "✗"} · openai{" "}
               {openAIKeySet ? "✓" : "✗"}
             </Text>
-          </VStack>
+          }
+        >
+          <SecureField
+            title="ElevenLabs Scribe Key"
+            prompt="xi-api-key"
+            value={scribeKeyDraft}
+            onChanged={(v) => {
+              setScribeKeyDraft(v)
+              if (v.length > 0) writeScribeKey(v)
+              else clearScribeKey()
+            }}
+          />
+          <SecureField
+            title="OpenAI Key"
+            prompt="sk-..."
+            value={openAIKeyDraft}
+            onChanged={(v) => {
+              setOpenAIKeyDraft(v)
+              if (v.length > 0) writeOpenAIKey(v)
+              else clearOpenAIKey()
+            }}
+          />
+        </Section>
 
-          {/* Stage 5b — polish 超时预设选择。脚本默认 20s，用户可按网络
-               情况调大调小。点按钮即写 Storage + 刷新本地 state；下一次
-               polish fetch 会读到新值。 */}
-          <VStack spacing={4} alignment="leading">
-            <Text font="caption" foregroundStyle="secondaryLabel">
-              润色超时（polish timeout）· 当前 {polishTimeoutPick}s
+        {err !== null ? (
+          <Section
+            header={
+              <Label
+                title={`错误${errKind !== null ? ` · ${errKind}` : ""}`}
+                systemImage="exclamationmark.triangle.fill"
+              />
+            }
+          >
+            <Text font="footnote" foregroundStyle="systemRed">
+              {err}
             </Text>
-            <HStack spacing={6}>
-              {[10, 20, 30, 60].map((sec) => (
-                <Button
-                  key={`polish-to-${sec}`}
-                  title={
-                    polishTimeoutPick === sec ? `✓ ${sec}s` : `${sec}s`
-                  }
-                  action={() => {
-                    writePolishTimeoutSec(sec)
-                    setPolishTimeoutPick(sec)
-                    setTick((t) => t + 1)
-                  }}
-                />
-              ))}
-              <Spacer />
-            </HStack>
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              网速慢 / 海外 / 蜂窝网络建议 30s+；超时后会降级插入未润色原文。
-            </Text>
-          </VStack>
-
-          <VStack spacing={4} alignment="leading">
-            <Text font="caption" foregroundStyle="secondaryLabel">
-              状态
-            </Text>
-            <Text font="title" foregroundStyle={statusColor}>
-              {statusLabel}
-            </Text>
-          </VStack>
-
-          <VStack spacing={8} alignment="leading">
-            <Text font="caption" foregroundStyle="secondaryLabel">
-              操作
-            </Text>
-            {state === "idle" ? (
-              <Button title="开启录音会话（前台）" action={startSession} />
-            ) : (
-              <Button title="强制终止会话" action={onEnd} />
-            )}
             <Button
-              title="🔬 前台测试录音 2 秒"
-              action={foregroundTestRecord}
-            />
-            <Button
-              title="清除状态（重置到 idle）"
-              action={async () => {
-                await resetToIdle()
+              role="destructive"
+              action={() => {
                 clearError()
+                clearErrorKind()
                 setTick((v) => v + 1)
               }}
-            />
-          </VStack>
+            >
+              <Label title="清除错误" systemImage="xmark.circle" />
+            </Button>
+          </Section>
+        ) : null}
 
-          {/* ---------------------------------------------------------------
-               Stage 4.5b — 保持麦克风（warm 会话面板）
-               idle: 显示 duration picker + 激活按钮
-               warm: 显示倒计时 + 提前结束
-               其他态（armed/transcribing/polishing/done）：隐藏，不占位
-             --------------------------------------------------------------- */}
-          {state === "idle" || state === "warm" ? (
-            <VStack spacing={8} alignment="leading">
-              <Text font="caption" foregroundStyle="secondaryLabel">
-                保持麦克风
-              </Text>
-              {state === "idle" ? (
-                <VStack spacing={6} alignment="leading">
-                  <Text font="footnote" foregroundStyle="secondaryLabel">
-                    激活后 Scripting 会在后台保持麦克风就绪；在选定时长内，
-                    你在任意 App 点键盘的录音按钮都可以直接录音。
-                  </Text>
-                  <HStack spacing={6}>
-                    {[1, 3, 5, 15, 30, 60].map((m) => (
-                      <Button
-                        key={`warm-pick-${m}`}
-                        title={
-                          warmPickMinutes === m
-                            ? `✓ ${m}min`
-                            : `${m}min`
-                        }
-                        action={() => {
-                          setWarmPickMinutes(m)
-                          setTick((t) => t + 1)
-                        }}
-                      />
-                    ))}
-                  </HStack>
-                  <Button
-                    title={`🔊 激活保持 ${warmPickMinutes} min`}
-                    action={async () => {
-                      const ok = await startWarmSession(
-                        warmPickMinutes * 60 * 1000
-                      )
-                      log("startWarmSession tap result:", ok)
-                      setTick((t) => t + 1)
-                    }}
-                  />
-                </VStack>
-              ) : (
-                <VStack spacing={6} alignment="leading">
-                  <Text font="title" foregroundStyle="systemBlue">
-                    剩余 {warmRemainingMMSS}
-                  </Text>
-                  <Text font="footnote" foregroundStyle="secondaryLabel">
-                    切到任意 App，点键盘 🎙 录音 即可直接录音；
-                    完成后自动回到保持态等待下一次。
-                  </Text>
-                  <Button
-                    title="✕ 提前结束"
-                    action={async () => {
-                      await stopWarmSession("user early stop")
-                      setTick((t) => t + 1)
-                    }}
-                  />
-                </VStack>
-              )}
-            </VStack>
-          ) : null}
-
-          {state === "armed" ? (
-            <Text foregroundStyle="secondaryLabel">
-              切到任意 App，唤出 Scripting 键盘，点麦克风即停止并插入
-            </Text>
-          ) : null}
-
-          {filePath !== null ? (
-            <VStack spacing={4} alignment="leading">
-              <Text font="caption" foregroundStyle="secondaryLabel">
-                录音文件
-              </Text>
-              <Text font="footnote">{filePath}</Text>
-              {/* Stage 5a — 调试回放。filePath.length===0 是 startWarmSession
-                   置空的情况（warm 还没录过），按钮隐藏避免空播。 */}
-              {filePath.length > 0 ? (
-                <HStack spacing={8}>
-                  <Button
-                    title="▶ 播放"
-                    action={() => debugPlayback(filePath)}
-                  />
-                  <Button title="⏸ 暂停" action={debugPlaybackPause} />
-                  <Spacer />
-                </HStack>
-              ) : null}
-              {sessionStartedAt !== null ? (
-                <Text font="footnote" foregroundStyle="secondaryLabel">
-                  started at {sessionStartedAt}
-                </Text>
-              ) : null}
-              {sessionEndedAt !== null ? (
-                <Text font="footnote" foregroundStyle="secondaryLabel">
-                  ended at {sessionEndedAt}
-                </Text>
-              ) : null}
-            </VStack>
-          ) : null}
-
-          {rawText !== null ? (
-            <VStack spacing={4} alignment="leading">
-              <Text font="caption" foregroundStyle="secondaryLabel">
-                Scribe 转录（rawText）
-              </Text>
-              <Text font="footnote">{rawText}</Text>
-            </VStack>
-          ) : null}
-
-          {finalText !== null ? (
-            <VStack spacing={4} alignment="leading">
-              <Text font="caption" foregroundStyle="secondaryLabel">
-                OpenAI 润色（finalText）
-              </Text>
-              <Text font="footnote">{finalText}</Text>
-            </VStack>
-          ) : null}
-
-          {err !== null ? (
-            <VStack spacing={4} alignment="leading">
-              <Text font="caption" foregroundStyle="red">
-                错误{errKind !== null ? ` · ${errKind}` : ""}
-              </Text>
-              <Text font="footnote" foregroundStyle="red">
-                {err}
-              </Text>
-              <Button
-                title="清除错误"
-                action={() => {
-                  clearError()
-                  clearErrorKind()
-                  setTick((v) => v + 1)
-                }}
-              />
-            </VStack>
-          ) : null}
-
-          <VStack spacing={6} alignment="leading">
-            <Text font="caption" foregroundStyle="secondaryLabel">
-              4.5a 实验 · 保活机制实测（不影响正常录音链路）
-            </Text>
-            {(["A1", "A2", "A3", "A4"] as ExperimentId[]).map((id) => {
-              const r = expResults[id]
-              const label =
-                id === "A1"
-                  ? "A1 · 裸 keepAlive"
-                  : id === "A2"
-                  ? "A2 · keepAlive + Live Activity"
-                  : id === "A3"
-                  ? "A3 · keepAlive + 静音录音"
-                  : "A4 · keepAlive + LA + 静音录音（官方组合）"
-              const result =
-                r === undefined
-                  ? "—"
-                  : r.firstHeartbeatAt === 0
-                  ? `error at ${((r.endedAt - r.startedAt) / 1000).toFixed(1)}s`
-                  : `存活 ${(
-                      (r.lastHeartbeatAt - r.firstHeartbeatAt) /
-                      1000
-                    ).toFixed(1)}s · ${r.cause}`
-              return (
-                <Text
-                  key={id}
-                  font="footnote"
+        {filePath !== null ||
+        rawText !== null ||
+        finalText !== null ? (
+          <Section title="最近结果">
+            {filePath !== null && filePath.length > 0 ? (
+              <HStack spacing={12}>
+                <Image
+                  systemName="waveform"
                   foregroundStyle="systemBlue"
-                >
-                  {label}: {result}
-                </Text>
-              )
-            })}
-            {expRunning !== null ? (
-              <Text font="footnote" foregroundStyle="orange">
-                {expRunning} 运行中 · 剩余{" "}
-                {Math.max(
-                  0,
-                  Math.floor((expEndAt - Date.now()) / 1000)
-                )}
-                s · 首 heartbeat 后持续{" "}
-                {expFirstHeartbeatAt > 0
-                  ? (
-                      (Date.now() - expFirstHeartbeatAt) /
-                      1000
-                    ).toFixed(1)
-                  : "—"}
-                s
-              </Text>
-            ) : null}
-            <Button
-              title="A1 · 裸 keepAlive"
-              action={() => {
-                if (expRunning !== null || sessionActive) {
-                  log("A1 tap ignored · busy")
-                  return
-                }
-                runExperiment("A1")
-                setTick((t) => t + 1)
-              }}
-            />
-            <Button
-              title="A2 · keepAlive + Live Activity"
-              action={() => {
-                if (expRunning !== null || sessionActive) {
-                  log("A2 tap ignored · busy")
-                  return
-                }
-                runExperiment("A2")
-                setTick((t) => t + 1)
-              }}
-            />
-            <Button
-              title="A3 · keepAlive + 静音录音"
-              action={() => {
-                if (expRunning !== null || sessionActive) {
-                  log("A3 tap ignored · busy")
-                  return
-                }
-                runExperiment("A3")
-                setTick((t) => t + 1)
-              }}
-            />
-            <Button
-              title="A4 · keepAlive + LA + 静音录音（官方组合）"
-              action={() => {
-                if (expRunning !== null || sessionActive) {
-                  log("A4 tap ignored · busy")
-                  return
-                }
-                runExperiment("A4")
-                setTick((t) => t + 1)
-              }}
-            />
-            {expRunning !== null ? (
-              <Button
-                title="提前结束当前实验"
-                action={async () => {
-                  await cancelExperiment()
-                  setTick((t) => t + 1)
-                }}
-              />
-            ) : null}
-            <Text font="footnote" foregroundStyle="secondaryLabel">
-              Script.onResume 路径测试：点下方按钮拷贝 URL 到剪贴板，切到备忘录
-              粘贴并点击链接，应看到日志新增 "onResume fired"，且**没有**
-              "script run · env=" 表示实例没重跑入口文件。
-            </Text>
-            <Button
-              title="拷贝 scripting://run/Voiceboard-V0.1?probe=1"
-              action={async () => {
-                const url = `scripting://run/${encodeURIComponent(
-                  Script.name
-                )}?probe=1`
-                await Pasteboard.setString(url)
-                log("onResume probe URL copied:", url)
-                setTick((t) => t + 1)
-              }}
-            />
-          </VStack>
-
-          {/* ---- Stage 6a · 键盘布局调参面板 ----
-               拖滑杆实时写 Storage，键盘（在其他 app 打开）≤400ms 内 re-render 生效。
-               字段按 5 大区分组；每区相互独立，不需要全量调。 */}
-          <VStack spacing={10} alignment="leading">
-            <HStack spacing={8}>
-              <Text font="caption" foregroundStyle="secondaryLabel">
-                键盘布局调参
-              </Text>
-              <Spacer />
-              <Button
-                title="重置全部"
-                action={() => {
-                  TUNE_SECTIONS.forEach((s) => {
-                    s.params.forEach(([key, , , , def]) => {
-                      writeTune(key, def)
-                    })
-                  })
-                  TUNE_BOOL_SECTIONS.forEach((s) => {
-                    s.params.forEach(([key, , def]) => {
-                      writeTuneBool(key, def)
-                    })
-                  })
-                  setTuneResetCounter((c) => c + 1)
-                  log("tune reset to defaults (sliders + toggles)")
-                }}
-              />
-            </HStack>
-            <Text font="caption2" foregroundStyle="secondaryLabel">
-              拖动 → 写 Storage → 键盘 ≤400ms 同步生效（回到有键盘的 app 即可看到）。
-              带蓝色数值 = 已偏离默认。
-            </Text>
-            {TUNE_SECTIONS.map((section) => (
-              <VStack
-                key={section.title}
-                spacing={8}
-                alignment="leading"
-              >
-                <Text
-                  font="footnote"
-                  fontWeight="semibold"
-                  foregroundStyle="secondaryLabel"
-                >
-                  · {section.title}
-                </Text>
-                {section.params.map(([keyName, label, min, max, def]) => (
-                  <TuneSlider
-                    key={`${keyName}-${tuneResetCounter}`}
-                    keyName={keyName}
-                    label={label}
-                    min={min}
-                    max={max}
-                    def={def}
+                />
+                <VStack alignment="leading" spacing={2}>
+                  <Text font="subheadline" fontWeight="medium">
+                    录音
+                  </Text>
+                  {latencyLine !== null ? (
+                    <Text
+                      font="footnote"
+                      foregroundStyle="secondaryLabel"
+                    >
+                      {latencyLine}
+                    </Text>
+                  ) : null}
+                </VStack>
+                <Spacer />
+                <Button action={() => debugPlayback(filePath)}>
+                  <Image
+                    systemName="play.circle.fill"
+                    font="title2"
+                    foregroundStyle="systemBlue"
                   />
-                ))}
-              </VStack>
-            ))}
-            {TUNE_BOOL_SECTIONS.map((section) => (
-              <VStack
-                key={section.title}
-                spacing={8}
-                alignment="leading"
-              >
-                <Text
-                  font="footnote"
-                  fontWeight="semibold"
-                  foregroundStyle="secondaryLabel"
-                >
-                  · {section.title}
-                </Text>
-                {section.params.map(([keyName, label, def]) => (
-                  <TuneToggle
-                    key={`${keyName}-${tuneResetCounter}`}
-                    keyName={keyName}
-                    label={label}
-                    def={def}
+                </Button>
+                <Button action={debugPlaybackPause}>
+                  <Image
+                    systemName="pause.circle"
+                    font="title2"
+                    foregroundStyle="secondaryLabel"
                   />
-                ))}
-              </VStack>
-            ))}
-          </VStack>
-
-          <VStack spacing={4} alignment="leading">
-            <Text font="caption" foregroundStyle="secondaryLabel">
-              调试
-            </Text>
-            {latencyLine !== null ? (
-              <Text font="footnote" foregroundStyle="systemBlue">
-                上次链路耗时 · {latencyLine}
-              </Text>
+                </Button>
+              </HStack>
             ) : null}
-            <Text font="footnote">
-              BackgroundKeeper.isActive ={" "}
-              {bgActive === null ? "…" : String(bgActive)}
-            </Text>
-            <Text font="footnote">sessionActive = {String(sessionActive)}</Text>
-            <Text font="footnote">
-              recorder != null = {String(recorder !== null)}
-            </Text>
-            <Text font="footnote">
-              silentKeeper != null = {String(silentKeeper !== null)}
-            </Text>
-            <Text font="footnote">heartbeat {heartbeatAgo}s ago</Text>
-            <Text font="footnote">queryParameters = {qpStr}</Text>
-            <Text font="footnote">
-              Script.name = {Script.name} · tick={tick}
-            </Text>
-            <Text font="footnote">
-              lastRecorderError = {lastRecorderError ?? "—"}
-            </Text>
-          </VStack>
+            {rawText !== null ? (
+              <VStack alignment="leading" spacing={4}>
+                <Label
+                  title="Scribe 转录"
+                  systemImage="text.quote"
+                />
+                <Text font="footnote" foregroundStyle="secondaryLabel">
+                  {rawText}
+                </Text>
+              </VStack>
+            ) : null}
+            {finalText !== null ? (
+              <VStack alignment="leading" spacing={4}>
+                <Label
+                  title="OpenAI 润色"
+                  systemImage="sparkles"
+                />
+                <Text font="footnote">{finalText}</Text>
+              </VStack>
+            ) : null}
+          </Section>
+        ) : null}
 
-          <VStack spacing={6} alignment="leading">
-            <HStack spacing={8}>
-              <Text font="caption" foregroundStyle="secondaryLabel">
-                日志 ({logEntries.length})
-              </Text>
-              <Spacer />
-              <Button
-                title="📋 复制"
-                action={async () => {
-                  const all = formatLog(readLog())
-                  await Pasteboard.setString(all)
-                  log("log copied to pasteboard ·", all.length, "chars")
-                  setTick((v) => v + 1)
-                }}
-              />
-              <Button
-                title="🗑 清空"
-                action={() => {
-                  clearLog()
-                  setTick((v) => v + 1)
-                }}
-              />
-            </HStack>
-            <Text font="footnote">
-              {recentLogText.length > 0 ? recentLogText : "(空)"}
-            </Text>
-          </VStack>
-        </VStack>
-      </ScrollView>
+        <Section>
+          <NavigationLink destination={<AdvancedView />}>
+            <Label
+              title="高级选项"
+              systemImage="slider.horizontal.3"
+            />
+          </NavigationLink>
+        </Section>
+      </List>
     </NavigationStack>
   )
 }
