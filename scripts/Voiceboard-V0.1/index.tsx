@@ -20,6 +20,8 @@ import {
   Text,
   Toggle,
   useEffect,
+  useObservable,
+  useRef,
   useState,
   VStack,
 } from "scripting"
@@ -1746,22 +1748,54 @@ const TUNE_BOOL_SECTIONS: Array<{
   },
 ]
 
-// 调参面板里的一根滑杆 + 即时数值显示。value 双向绑定到 Storage 的 tune key。
-// 拖拽时本地 setState 即时 UI 响应；onChanged 同时写 Storage，键盘下一轮 poll 生效。
+// 调参面板里的一根滑杆 + 即时数值显示。
+//
+// 2026-04-22 · useState → useObservable 改造。
+// 之前用 useState + Slider `value={val}` + onChanged={setVal+writeTune}，真机
+// 表现为"推一下动一下、大部分时候断触"。根因：React 的 setState 是异步批处理
+// 调度的，跨 bridge 传回 SwiftUI 的 `value={val}` 滞后于手指连续手势；同时
+// MainView 400ms setTick 全局重渲染会在拖动中途重建 Slider view → 手势 session
+// 断。
+//
+// 修法走 dts:6449 的 Slider Observable binding 分支（`value: Observable<number>`，
+// 无 onChanged）：useObservable 的 setValue 是**同步**跨 bridge 写 SwiftUI @State，
+// 连续手势不被 React 调度器拖慢。配合 useEffect([val]) 订阅写 Storage。
 function TuneSlider({
   keyName,
   label,
   min,
   max,
   def,
+  resetTrigger,
 }: {
   keyName: string
   label: string
   min: number
   max: number
   def: number
+  resetTrigger: number
 }) {
-  const [val, setVal] = useState<number>(() => readTune(keyName, def))
+  const valObs = useObservable<number>(() => readTune(keyName, def))
+  const val = valObs.value
+  // 订阅 val 写 Storage。初次 mount 时会写一次同值，无副作用；之后每次
+  // SwiftUI Slider 手势引起 Observable 变化 → React 重渲染 → useEffect 命中。
+  useEffect(() => {
+    writeTune(keyName, val)
+  }, [val])
+  // 2026-04-22 · resetTrigger 机制。parent 点「重置默认值」时 counter++，
+  // 这里 useEffect 命中 → Observable 同步写 def → SwiftUI Slider 视觉回默认位。
+  // 关键：TuneSlider 实例跨 reset 保持稳定(parent 的 map key 不再含 counter)，
+  // 所以 Observable 实例整个组件生命周期内唯一，SwiftUI binding source 不换 →
+  // 手势 session 不被 reset 打断。mountedRef 跳过初次 mount fire，避免把用户
+  // 已调到的值顶回 def。
+  const mountedRef = useRef(false)
+  useEffect(() => {
+    if (!mountedRef.current) {
+      mountedRef.current = true
+      return
+    }
+    valObs.setValue(def)
+  }, [resetTrigger])
   return (
     <VStack alignment="leading" spacing={2}>
       <HStack spacing={8}>
@@ -1777,16 +1811,10 @@ function TuneSlider({
         </Text>
       </HStack>
       <Slider
-        value={val}
+        value={valObs}
         min={min}
         max={max}
         step={1}
-        onChanged={(v) => {
-          const rounded = Math.round(v)
-          if (rounded === val) return
-          setVal(rounded)
-          writeTune(keyName, rounded)
-        }}
       />
     </VStack>
   )
@@ -1794,26 +1822,36 @@ function TuneSlider({
 
 // Stage 6a Phase C — 布尔 tune 开关。与 TuneSlider 并列，不同点：
 // 存储是 boolean（走 readTuneBool / writeTuneBool），控件是 iOS 原生 Toggle。
-// 状态切到 true/false 立即写 Storage，键盘 useEffect 同步后调 CustomKeyboard.* 生效。
+//
+// 2026-04-22 · 一并走 Observable binding（dts:6780 `value: Observable<boolean>`），
+// 跟 TuneSlider 保持一致性。Toggle 不涉及连续手势，但采用同一模式避免再次
+// 踩 React async scheduling 的坑。
 function TuneToggle({
   keyName,
   label,
   def,
+  resetTrigger,
 }: {
   keyName: string
   label: string
   def: boolean
+  resetTrigger: number
 }) {
-  const [val, setVal] = useState<boolean>(() => readTuneBool(keyName, def))
+  const valObs = useObservable<boolean>(() => readTuneBool(keyName, def))
+  const val = valObs.value
+  useEffect(() => {
+    writeTuneBool(keyName, val)
+  }, [val])
+  const mountedRef = useRef(false)
+  useEffect(() => {
+    if (!mountedRef.current) {
+      mountedRef.current = true
+      return
+    }
+    valObs.setValue(def)
+  }, [resetTrigger])
   return (
-    <Toggle
-      title={label}
-      value={val}
-      onChanged={(v) => {
-        setVal(v)
-        writeTuneBool(keyName, v)
-      }}
-    />
+    <Toggle title={label} value={valObs} />
   )
 }
 
@@ -1832,42 +1870,58 @@ function fmtSec(ms: number): string {
   return (ms / 1000).toFixed(2) + "s"
 }
 
-function PolishTimeoutView() {
+// ---------------------------------------------------------------------------
+// 2026-04-22 修复 · DisclosureGroup 折叠方案
+//
+// 之前把这三个调参面板做成 NavigationLink destination（2 层深），mount ~1s 后
+// Scripting reconciler 会 cleanup 所有 React closure —— **包括 Slider/Picker/
+// Toggle 的 onChanged**。表现为"滑块能动（SwiftUI 原生视觉跟手），但松手后
+// Storage 没写、UI 数字不变、重置按钮无反应"。
+//
+// 修法：把内容从 destination 下沉到 AdvancedView（level 1）里的 DisclosureGroup,
+// 不再经过 NavigationLink push。AdvancedView 本身 hooks 是稳定的（LogView
+// 日志清空/复制已验证）。三个 Content FC 作为 top-level FunctionComponent,
+// 在 AdvancedView 的 JSX 树里 inline 渲染。
+// ---------------------------------------------------------------------------
+
+function PolishTimeoutContent() {
   const [picked, setPicked] = useState<number>(() => readPolishTimeoutSec())
   return (
-    <List listStyle="insetGrouped" navigationTitle="润色超时">
-      <Section
-        header={
-          <Text font="caption" foregroundStyle="secondaryLabel">
-            当前 {picked}s
-          </Text>
-        }
-        footer={
-          <Text font="footnote" foregroundStyle="secondaryLabel">
-            网速慢 / 海外 / 蜂窝网络建议 30s+；超时后会降级插入未润色原文。
-          </Text>
-        }
-      >
-        <Picker
-          title="polish timeout"
-          pickerStyle="segmented"
-          value={picked}
-          onChanged={(v) => {
-            writePolishTimeoutSec(v as number)
-            setPicked(v as number)
-          }}
+    <NavigationStack>
+      <List listStyle="insetGrouped" navigationTitle="润色超时">
+        <Section
+          header={
+            <Text font="caption" foregroundStyle="secondaryLabel">
+              当前 {picked}s
+            </Text>
+          }
+          footer={
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              网速慢 / 海外 / 蜂窝网络建议 30s+；超时后会降级插入未润色原文。
+            </Text>
+          }
         >
-          <Text tag={10}>10s</Text>
-          <Text tag={20}>20s</Text>
-          <Text tag={30}>30s</Text>
-          <Text tag={60}>60s</Text>
-        </Picker>
-      </Section>
-    </List>
+          <Picker
+            title="polish timeout"
+            pickerStyle="segmented"
+            value={picked}
+            onChanged={(v) => {
+              writePolishTimeoutSec(v as number)
+              setPicked(v as number)
+            }}
+          >
+            <Text tag={10}>10s</Text>
+            <Text tag={20}>20s</Text>
+            <Text tag={30}>30s</Text>
+            <Text tag={60}>60s</Text>
+          </Picker>
+        </Section>
+      </List>
+    </NavigationStack>
   )
 }
 
-function KeyboardTuneView() {
+function KeyboardTuneContent() {
   const [localResetCounter, setLocalResetCounter] = useState(0)
   const KBD_TITLES = new Set([
     "键盘整体",
@@ -1882,64 +1936,68 @@ function KeyboardTuneView() {
     (s) => s.title === "系统键盘层（iOS 原生）"
   )
   return (
-    <List listStyle="insetGrouped" navigationTitle="键盘调参">
-      <Section
-        footer={
-          <Text font="footnote" foregroundStyle="secondaryLabel">
-            拖动 → 写 Storage → 键盘 ≤400ms 同步生效。带蓝色数值 = 已偏离默认。
-          </Text>
-        }
-      >
-        <Button
-          role="destructive"
-          action={() => {
-            kbdSections.forEach((s) =>
-              s.params.forEach(([key, , , , def]) => writeTune(key, def))
-            )
-            kbdBoolSections.forEach((s) =>
-              s.params.forEach(([key, , def]) => writeTuneBool(key, def))
-            )
-            setLocalResetCounter((c) => c + 1)
-            vblog("index", "keyboard tune reset to defaults")
-          }}
+    <NavigationStack>
+      <List listStyle="insetGrouped" navigationTitle="键盘调参">
+        <Section
+          footer={
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              拖动 → 写 Storage → 键盘 ≤400ms 同步生效。带蓝色数值 = 已偏离默认。
+            </Text>
+          }
         >
-          <Label
-            title="重置键盘默认值"
-            systemImage="arrow.counterclockwise"
-          />
-        </Button>
-      </Section>
-      {kbdSections.map((section) => (
-        <Section key={section.title} title={section.title}>
-          {section.params.map(([keyName, label, min, max, def]) => (
-            <TuneSlider
-              key={`${keyName}-${localResetCounter}`}
-              keyName={keyName}
-              label={label}
-              min={min}
-              max={max}
-              def={def}
+          <Button
+            role="destructive"
+            action={() => {
+              kbdSections.forEach((s) =>
+                s.params.forEach(([key, , , , def]) => writeTune(key, def))
+              )
+              kbdBoolSections.forEach((s) =>
+                s.params.forEach(([key, , def]) => writeTuneBool(key, def))
+              )
+              setLocalResetCounter((c) => c + 1)
+              vblog("index", "keyboard tune reset to defaults")
+            }}
+          >
+            <Label
+              title="重置键盘默认值"
+              systemImage="arrow.counterclockwise"
             />
-          ))}
+          </Button>
         </Section>
-      ))}
-      {kbdBoolSections.map((section) => (
-        <Section key={section.title} title={section.title}>
-          {section.params.map(([keyName, label, def]) => (
-            <TuneToggle
-              key={`${keyName}-${localResetCounter}`}
-              keyName={keyName}
-              label={label}
-              def={def}
-            />
-          ))}
-        </Section>
-      ))}
-    </List>
+        {kbdSections.map((section) => (
+          <Section key={section.title} title={section.title}>
+            {section.params.map(([keyName, label, min, max, def]) => (
+              <TuneSlider
+                key={keyName}
+                keyName={keyName}
+                label={label}
+                min={min}
+                max={max}
+                def={def}
+                resetTrigger={localResetCounter}
+              />
+            ))}
+          </Section>
+        ))}
+        {kbdBoolSections.map((section) => (
+          <Section key={section.title} title={section.title}>
+            {section.params.map(([keyName, label, def]) => (
+              <TuneToggle
+                key={keyName}
+                keyName={keyName}
+                label={label}
+                def={def}
+                resetTrigger={localResetCounter}
+              />
+            ))}
+          </Section>
+        ))}
+      </List>
+    </NavigationStack>
   )
 }
 
-function DynamicIslandTuneView() {
+function DynamicIslandTuneContent() {
   const [localResetCounter, setLocalResetCounter] = useState(0)
   const DI_TITLES = new Set([
     "灵动岛 · 紧凑态 + 最小",
@@ -1951,60 +2009,64 @@ function DynamicIslandTuneView() {
     (s) => s.title === "灵动岛 · 显隐开关"
   )
   return (
-    <List listStyle="insetGrouped" navigationTitle="灵动岛调参">
-      <Section
-        footer={
-          <Text font="footnote" foregroundStyle="secondaryLabel">
-            拖动 → 写 Storage → Live Activity ≤1s 同步生效。
-          </Text>
-        }
-      >
-        <Button
-          role="destructive"
-          action={() => {
-            diSections.forEach((s) =>
-              s.params.forEach(([key, , , , def]) => writeTune(key, def))
-            )
-            diBoolSections.forEach((s) =>
-              s.params.forEach(([key, , def]) => writeTuneBool(key, def))
-            )
-            setLocalResetCounter((c) => c + 1)
-            vblog("index", "dynamic island tune reset to defaults")
-          }}
+    <NavigationStack>
+      <List listStyle="insetGrouped" navigationTitle="灵动岛调参">
+        <Section
+          footer={
+            <Text font="footnote" foregroundStyle="secondaryLabel">
+              拖动 → 写 Storage → Live Activity ≤1s 同步生效。
+            </Text>
+          }
         >
-          <Label
-            title="重置灵动岛默认值"
-            systemImage="arrow.counterclockwise"
-          />
-        </Button>
-      </Section>
-      {diSections.map((section) => (
-        <Section key={section.title} title={section.title}>
-          {section.params.map(([keyName, label, min, max, def]) => (
-            <TuneSlider
-              key={`${keyName}-${localResetCounter}`}
-              keyName={keyName}
-              label={label}
-              min={min}
-              max={max}
-              def={def}
+          <Button
+            role="destructive"
+            action={() => {
+              diSections.forEach((s) =>
+                s.params.forEach(([key, , , , def]) => writeTune(key, def))
+              )
+              diBoolSections.forEach((s) =>
+                s.params.forEach(([key, , def]) => writeTuneBool(key, def))
+              )
+              setLocalResetCounter((c) => c + 1)
+              vblog("index", "dynamic island tune reset to defaults")
+            }}
+          >
+            <Label
+              title="重置灵动岛默认值"
+              systemImage="arrow.counterclockwise"
             />
-          ))}
+          </Button>
         </Section>
-      ))}
-      {diBoolSections.map((section) => (
-        <Section key={section.title} title={section.title}>
-          {section.params.map(([keyName, label, def]) => (
-            <TuneToggle
-              key={`${keyName}-${localResetCounter}`}
-              keyName={keyName}
-              label={label}
-              def={def}
-            />
-          ))}
-        </Section>
-      ))}
-    </List>
+        {diSections.map((section) => (
+          <Section key={section.title} title={section.title}>
+            {section.params.map(([keyName, label, min, max, def]) => (
+              <TuneSlider
+                key={keyName}
+                keyName={keyName}
+                label={label}
+                min={min}
+                max={max}
+                def={def}
+                resetTrigger={localResetCounter}
+              />
+            ))}
+          </Section>
+        ))}
+        {diBoolSections.map((section) => (
+          <Section key={section.title} title={section.title}>
+            {section.params.map(([keyName, label, def]) => (
+              <TuneToggle
+                key={keyName}
+                keyName={keyName}
+                label={label}
+                def={def}
+                resetTrigger={localResetCounter}
+              />
+            ))}
+          </Section>
+        ))}
+      </List>
+    </NavigationStack>
   )
 }
 
@@ -2333,10 +2395,18 @@ function MainView() {
     if (prev !== null && prev > 0) return Math.round(prev / 60000)
     return 3
   })
-  // Stage 7 post-ship — tuneResetCounter 与 polishTimeoutPick 已从 MainView
-  // 下沉到各自孙子页本地 useState。原因：这些 state 只被 push 到导航栈的
-  // Tune/PolishTimeout 子页使用，而孙子页 mount 后与 MainView 重渲染脱钩，
-  // 放在 MainView 的 state 等于 stale。下沉后按钮事件直接触发本子页重渲染。
+  // 2026-04-22 · sheet 模态方案
+  //
+  // 原方案用 DisclosureGroup 折叠在 AdvancedView 里展开，可工作但 Slider 手势
+  // 被 NavigationStack 的 interactivePopGesture 拦截（AdvancedView 是 push 子页，
+  // iOS 给它启用右滑返回手势，跟 Slider 横向拖动冲突）—— 用户真机表现为
+  // "拖一次断一次、容易右滑退出"。
+  //
+  // 修法：调参面板改用 sheet 弹出。sheet 没有 pop gesture（关闭是垂直下拖），
+  // 跟 Slider 横向完全正交。sheet state 放在 MainView 层（跨 setTick 持久）。
+  const [polishSheetOpen, setPolishSheetOpen] = useState(false)
+  const [kbdSheetOpen, setKbdSheetOpen] = useState(false)
+  const [diSheetOpen, setDiSheetOpen] = useState(false)
 
   useEffect(() => {
     const q = Script.queryParameters ?? {}
@@ -2555,15 +2625,15 @@ function MainView() {
     return (
       <List listStyle="insetGrouped" navigationTitle="高级选项">
         <Section title="调节">
-          <NavigationLink destination={<PolishTimeoutView />}>
+          <Button action={() => setPolishSheetOpen(true)}>
             <Label title="润色超时" systemImage="timer" />
-          </NavigationLink>
-          <NavigationLink destination={<KeyboardTuneView />}>
+          </Button>
+          <Button action={() => setKbdSheetOpen(true)}>
             <Label title="键盘调参" systemImage="keyboard" />
-          </NavigationLink>
-          <NavigationLink destination={<DynamicIslandTuneView />}>
+          </Button>
+          <Button action={() => setDiSheetOpen(true)}>
             <Label title="灵动岛调参" systemImage="capsule.portrait" />
-          </NavigationLink>
+          </Button>
         </Section>
 
         <Section title="操作">
@@ -2648,6 +2718,23 @@ function MainView() {
         listStyle="insetGrouped"
         navigationTitle="Voiceboard"
         navigationBarTitleDisplayMode="inline"
+        sheet={[
+          {
+            content: <PolishTimeoutContent />,
+            isPresented: polishSheetOpen,
+            onChanged: setPolishSheetOpen,
+          },
+          {
+            content: <KeyboardTuneContent />,
+            isPresented: kbdSheetOpen,
+            onChanged: setKbdSheetOpen,
+          },
+          {
+            content: <DynamicIslandTuneContent />,
+            isPresented: diSheetOpen,
+            onChanged: setDiSheetOpen,
+          },
+        ]}
       >
         {q.action === "arm" && state !== "idle" ? (
           <Section>
