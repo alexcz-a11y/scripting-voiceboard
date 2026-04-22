@@ -1,19 +1,22 @@
 // Stage 4.5b — 生产版 Live Activity 注册。
-// Stage 6b v4.1 — 灵动岛 UI（真机反馈后修正）：
+// Stage 6b v4.2 — 灵动岛 UI（二次真机反馈后修正）：
 //   · Compact: 仅 leading（删 trailing 图标，让 camera pill 物理占位）
 //   · Expanded: 3 region 顺延 Apple HIG
-//       Leading  (pill 左侧窄列): VOICEBOARD 品牌字 + 大图标(56pt) 竖排
-//       Center   (pill 正下方居中): 主文案 headline + caption
-//       Trailing (pill 右侧窄列): 空 Text 占位
+//       Leading  (pill 左侧 + 下方 L 形): VOICEBOARD + 大图标(56pt) 竖排
+//       Center   : 空占位（v4.1 放 Center 会挤占 Leading 视觉位置）
+//       Trailing (pill 右侧 + 下方 wrap): 主文案 headline + caption
+//                 使用 Spacer 把内容推到 region 底部 → 视觉上呈现在
+//                 "pill 下方的中央偏右"（Trailing region wrap 下来的位置）
+//                 alignment="trailing" + offset 微调让用户拖到满意位置
 //       Bottom   : 不用
 //   · Voiceboard Ink 品牌色板 · DynamicShapeStyle 自动 light/dark
 //   · 视觉参数全部走 readTune(key, def)
 //
-// v4 真机验证结果 (2026-04-22):
-//   · `background="#FFFFFF14" + cornerRadius=32` 在 LA 子视图里不渲染卡片 →
-//     放弃圆角半透白卡片方案，回到裸文字/图标的 SwiftUI 默认布局
-//   · Trailing region 是 pill **右侧窄列**（不是"pill 下方大横"），主文案
-//     应该放在 Center region（pill 正下方）才能跨 pill 左右居中显示
+// 演化记录：
+//   v4   尝试 Leading/Trailing 两张圆角半透卡 → 真机卡片背景不渲染
+//   v4.1 主文案放 Center region → 居中会挤占 Leading 图标视觉位置
+//   v4.2 主文案放 Trailing region + Spacer 顶部 + 下 alignment=trailing
+//        → pill 右侧 wrap 到下方右半，不干扰 Leading
 //
 // 参考: developer.apple.com/documentation/WidgetKit/DynamicIslandExpandedRegion
 // 设计板: /tmp/voiceboard-design/dynamic-island.html
@@ -155,16 +158,16 @@ function trailingCaption(state: VBActivityState): string {
 }
 
 // --------------------------------------------------------------------------
-// Stage 6b v4.1 — DI 视觉 tune 读取（精简）
+// Stage 6b v4.2 — DI 视觉 tune 读取
 // --------------------------------------------------------------------------
 // builder 每次 iOS update 时重新调用（dts:7823），const tune = readDiTune()
 // 每次重读 Storage → 调参面板 ≤1s（受 LA 1000ms 节流）生效。
 //
-// v4.1 变更（vs v4）：
-//   · 删除卡片背景相关键（真机不渲染）：et.rightPad / ex.cardGap / ex.cardRadius /
-//     ex.cardPad / ex.bottomPad / cards.visible
-//   · 主文案 tune 从 `et.*` 改名 `ec.*`（实际渲染在 Center region，不是 Trailing）
-//   · 新增 el.brandIconGap（Leading 里 VOICEBOARD 和 icon 之间的距离）
+// v4.2 变更（vs v4.1）：
+//   · 主文案 tune 键名改回 `et.*`（因为实际渲染在 Trailing region 而非 Center）
+//   · 新增 et.offsetX / et.offsetY（文案位置微调）
+//   · 新增 et.spacerMinHeight（Trailing region 内顶部 Spacer 最小高度，
+//     控制文案被推到 pill 下方的距离）
 
 function readDiTune() {
   return {
@@ -176,13 +179,15 @@ function readDiTune() {
     clPadV:         readTune("di.cl.padV",        2),
     // ----- Minimal -----
     minIconSize:    readTune("di.min.iconSize",  16),
-    // ----- Expanded Leading (pill 左侧): VOICEBOARD + 大图标 -----
+    // ----- Expanded Leading (pill 左侧 + 下方): VOICEBOARD + 大图标 -----
     elIconSize:     readTune("di.el.iconSize",   56),
     elBrandIconGap: readTune("di.el.brandIconGap",4),
-    // ----- Expanded Center (pill 正下方): 主文案 headline + caption -----
-    ecHeadlineSize: readTune("di.ec.headlineSize",17),
-    ecCaptionSize:  readTune("di.ec.captionSize",12),
-    ecRowSpacing:   readTune("di.ec.rowSpacing",  3),
+    // ----- Expanded Trailing (pill 右侧 + 下方 wrap): 主文案 headline + caption -----
+    etHeadlineSize: readTune("di.et.headlineSize",17),
+    etCaptionSize:  readTune("di.et.captionSize",12),
+    etRowSpacing:   readTune("di.et.rowSpacing",  3),
+    etOffsetX:      readTune("di.et.offsetX",     0),  // 正值往右 / 负值往左
+    etOffsetY:      readTune("di.et.offsetY",     0),  // 正值往下 / 负值往上
     // ----- Voiceboard 品牌字（Leading 顶部） -----
     brandTextSize:  readTune("di.brand.textSize",11),
   }
@@ -297,24 +302,32 @@ function ExpandedLeading(state: VBActivityState) {
   )
 }
 
-// v4.1: DI 展开态右侧 —— 空占位（Trailing region 是 pill 右侧窄列，
-// Voiceboard 在 warm/armed 以外没有需要放右列的内容）。
-function ExpandedTrailing(_state: VBActivityState) {
-  return <Text>{""}</Text>
-}
-
-// v4.1: DI 展开态中部（pill 正下方居中）—— 主文案 headline + caption。
-// 真机上 Center region 渲染在 pill 下方居中位置，可跨 pill 左右宽度。
-function ExpandedCenter(state: VBActivityState) {
+// v4.2: DI 展开态右侧（pill 右侧 + 下方 wrap）—— 主文案 headline + caption。
+//
+// 布局策略：
+//   VStack alignment="trailing"
+//     ├ Spacer          (把内容推到 region 底部，避开 pill 高度)
+//     ├ Text headline   (主状态文字, 状态色 bold)
+//     └ Text caption    (mono 时码/模型/重试提示, secondaryLabel)
+//   offset={{ x: etOffsetX, y: etOffsetY }}  (用户微调左右/上下)
+//
+// 效果: 文案显示在 pill 右侧 wrap 下来的区域（视觉上在"下方中心偏右"），
+// 不与 Leading 的 VOICEBOARD + 图标视觉重叠。
+function ExpandedTrailing(state: VBActivityState) {
   const tune = readDiTune()
   const color = statusBrandColor(state.status)
   return (
-    <VStack alignment="center" spacing={tune.ecRowSpacing}>
-      <Text font={tune.ecHeadlineSize} foregroundStyle={color} bold>
+    <VStack
+      alignment="trailing"
+      spacing={tune.etRowSpacing}
+      offset={{ x: tune.etOffsetX, y: tune.etOffsetY }}
+    >
+      <Spacer />
+      <Text font={tune.etHeadlineSize} foregroundStyle={color} bold>
         {trailingHeadline(state)}
       </Text>
       <Text
-        font={tune.ecCaptionSize}
+        font={tune.etCaptionSize}
         foregroundStyle="secondaryLabel"
         monospacedDigit
       >
@@ -322,6 +335,12 @@ function ExpandedCenter(state: VBActivityState) {
       </Text>
     </VStack>
   )
+}
+
+// v4.2: DI 展开态中部 —— 空占位。主文案移到 Trailing region。
+// （v4.1 尝试放 Center 会让文案与 Leading 图标水平位置冲突，故移除。）
+function ExpandedCenter(_state: VBActivityState) {
+  return <Text>{""}</Text>
 }
 
 // --------------------------------------------------------------------------

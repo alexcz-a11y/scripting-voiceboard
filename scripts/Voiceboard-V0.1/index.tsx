@@ -1671,10 +1671,11 @@ const TUNE_SECTIONS: Array<{
       ["mic.offsetY",     "上下移动",     -40,  40,   0],
     ],
   },
-  // ---------- Stage 6b v4.1 · 灵动岛（Dynamic Island）3 节 ----------
+  // ---------- Stage 6b v4.2 · 灵动岛（Dynamic Island）3 节 ----------
   //
-  // v4.1 真机验证后简化：卡片背景不渲染 → 放弃圆角卡片，回到 SwiftUI 默认布局。
-  // 主文案搬到 Center region（pill 正下方居中），Trailing region 留空。
+  // v4.2 真机二次反馈：主文案从 Center region 移到 Trailing region，
+  // 因为 Center 居中会挤占 Leading 图标视觉位置。Trailing wrap 到 pill
+  // 下方右半，自然"下方中心偏右"。新增 offsetX/Y 让用户微调文案位置。
   //
   // 视觉参数热调，键名前缀 `di.*`，`live_activity.tsx` builder 每次 iOS update
   // 重读 Storage → 改参数 ≤1s（受 LA 1000ms 节流）生效。
@@ -1699,11 +1700,13 @@ const TUNE_SECTIONS: Array<{
     ],
   },
   {
-    title: "灵动岛 · 展开中（主文案）",
+    title: "灵动岛 · 展开右（主文案 · 下方偏右）",
     params: [
-      ["di.ec.headlineSize", "主文字 大小",         12, 24, 17],
-      ["di.ec.captionSize",  "副文字 大小",          9, 18, 12],
-      ["di.ec.rowSpacing",   "主副文字 距离",        0, 10,  3],
+      ["di.et.headlineSize", "主文字 大小",         12, 24, 17],
+      ["di.et.captionSize",  "副文字 大小",          9, 18, 12],
+      ["di.et.rowSpacing",   "主副文字 距离",        0, 10,  3],
+      ["di.et.offsetX",      "左右移动",           -60, 30,  0],
+      ["di.et.offsetY",      "上下移动",           -40, 40,  0],
     ],
   },
 ]
