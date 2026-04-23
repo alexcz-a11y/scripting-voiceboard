@@ -88,6 +88,7 @@ import {
   writeSessionEndedAt,
   writeSessionStartedAt,
   writeSttMs,
+  writeAction,
   writeState,
   writeTune,
   writeTuneBool,
@@ -541,6 +542,19 @@ async function startWarmSession(durationMs: number): Promise<boolean> {
 // record 级 hard error。
 async function stopWarmSession(reason: string): Promise<void> {
   log("stopWarmSession · reason=", reason)
+
+  // Teardown 入口先同步切断运行态信号。否则 stop keeper 后、state 写回 idle
+  // 前的 await 窗口里 worker 可能再跑一拍, 看到 state=warm + keeper=null,
+  // 误报 keeper watchdog invariant violation 并触发第二次 teardown。
+  workerCancelled = true
+  sessionActive = false
+  clearAction()
+  clearActiveTree()
+  clearWarmUntil()
+  doneStateSetAt = 0
+  cycleEndInFlight = false
+  writeState("idle")
+
   await stopWarmSilentKeeper()
 
   // 真实 recorder 如果还活着也要关（armed 期间被 stopWarmSession 打断的场景）
@@ -574,12 +588,8 @@ async function stopWarmSession(reason: string): Promise<void> {
   }
 
   await teardownAudioSession()
-  clearWarmUntil()
   // 注意：**不清 warmDurationMs**。持久化的用户偏好，跨 warm 结束要保留，
   // 下次冷启动 / 打开主 app 时 duration picker 才能回填到用户上次选的档位。
-  doneStateSetAt = 0
-  cycleEndInFlight = false
-  writeState("idle")
 }
 
 // 一次录音 cycle（armed → transcribing → polishing → done）结束之后的
@@ -1597,6 +1607,10 @@ function registerOnResumeListener(): void {
         log(
           "onResume · probe=1 detected · 既有实例仍存活，没有重跑入口"
         )
+      }
+      if (q && q.action === "stop") {
+        log("onResume · action=stop detected · writeAction(stop)")
+        writeAction("stop")
       }
     })
     log("Script.onResume listener registered")
