@@ -49,3 +49,7 @@ tmp/
 
 # 本地演示/草稿 HTML（临时调研用，不入库）
 animation-demo.html
+
+# 本地协作 / 报告草稿（非源码，不入库）
+AGENTS.md
+report-to-thomfang.txt
